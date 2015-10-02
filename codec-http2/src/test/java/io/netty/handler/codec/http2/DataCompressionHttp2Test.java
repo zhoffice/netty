@@ -14,19 +14,6 @@
  */
 package io.netty.handler.codec.http2;
 
-import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_PRIORITY_WEIGHT;
-import static io.netty.handler.codec.http2.Http2TestUtil.as;
-import static io.netty.handler.codec.http2.Http2TestUtil.runInChannel;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.SECONDS;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyBoolean;
-import static org.mockito.Matchers.anyInt;
-import static org.mockito.Matchers.eq;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.verify;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -42,21 +29,11 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
-import io.netty.handler.codec.http2.Http2Stream.State;
-import io.netty.handler.codec.http2.Http2TestUtil.FrameAdapter;
-import io.netty.handler.codec.http2.Http2TestUtil.FrameCountDown;
 import io.netty.handler.codec.http2.Http2TestUtil.Http2Runnable;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
 import io.netty.util.NetUtil;
 import io.netty.util.concurrent.Future;
-
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.util.Random;
-import java.util.concurrent.CountDownLatch;
-
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -65,13 +42,33 @@ import org.mockito.MockitoAnnotations;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+
+import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_PRIORITY_WEIGHT;
+import static io.netty.handler.codec.http2.Http2TestUtil.runInChannel;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
+import static org.mockito.Matchers.anyInt;
+import static org.mockito.Matchers.anyShort;
+import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.verify;
+
 /**
  * Test for data decompression in the HTTP/2 codec.
  */
 public class DataCompressionHttp2Test {
-    private static final AsciiString GET = as("GET");
-    private static final AsciiString POST = as("POST");
-    private static final AsciiString PATH = as("/some/path");
+    private static final AsciiString GET = new AsciiString("GET");
+    private static final AsciiString POST = new AsciiString("POST");
+    private static final AsciiString PATH = new AsciiString("/some/path");
 
     @Mock
     private Http2FrameListener serverListener;
@@ -84,15 +81,34 @@ public class DataCompressionHttp2Test {
     private Channel serverChannel;
     private Channel clientChannel;
     private CountDownLatch serverLatch;
-    private CountDownLatch clientLatch;
-    private CountDownLatch clientSettingsAckLatch;
     private Http2Connection serverConnection;
     private Http2Connection clientConnection;
+    private Http2ConnectionHandler clientHandler;
     private ByteArrayOutputStream serverOut;
 
     @Before
-    public void setup() throws InterruptedException {
+    public void setup() throws InterruptedException, Http2Exception {
         MockitoAnnotations.initMocks(this);
+        doAnswer(new Answer<Void>() {
+            @Override
+            public Void answer(InvocationOnMock invocation) throws Throwable {
+                if (invocation.getArgumentAt(4, Boolean.class)) {
+                    serverConnection.stream(invocation.getArgumentAt(1, Integer.class)).close();
+                }
+                return null;
+            }
+        }).when(serverListener).onHeadersRead(any(ChannelHandlerContext.class), anyInt(), any(Http2Headers.class),
+                anyInt(), anyBoolean());
+        doAnswer(new Answer<Void>() {
+            @Override
+            public Void answer(InvocationOnMock invocation) throws Throwable {
+                if (invocation.getArgumentAt(7, Boolean.class)) {
+                    serverConnection.stream(invocation.getArgumentAt(1, Integer.class)).close();
+                }
+                return null;
+            }
+        }).when(serverListener).onHeadersRead(any(ChannelHandlerContext.class), anyInt(), any(Http2Headers.class),
+                anyInt(), anyShort(), anyBoolean(), anyInt(), anyBoolean());
     }
 
     @After
@@ -102,7 +118,14 @@ public class DataCompressionHttp2Test {
 
     @After
     public void teardown() throws InterruptedException {
-        serverChannel.close().sync();
+        if (clientChannel != null) {
+            clientChannel.close().sync();
+            clientChannel = null;
+        }
+        if (serverChannel != null) {
+            serverChannel.close().sync();
+            serverChannel = null;
+        }
         Future<?> serverGroup = sb.group().shutdownGracefully(0, 0, MILLISECONDS);
         Future<?> serverChildGroup = sb.childGroup().shutdownGracefully(0, 0, MILLISECONDS);
         Future<?> clientGroup = cb.group().shutdownGracefully(0, 0, MILLISECONDS);
@@ -113,19 +136,15 @@ public class DataCompressionHttp2Test {
 
     @Test
     public void justHeadersNoData() throws Exception {
-        bootstrapEnv(1, 1, 0, 1);
+        bootstrapEnv(0);
         final Http2Headers headers = new DefaultHttp2Headers().method(GET).path(PATH)
                 .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.GZIP);
 
-        // Required because the decompressor intercepts the onXXXRead events before
-        // our {@link Http2TestUtil$FrameAdapter} does.
-        FrameAdapter.getOrCreateStream(serverConnection, 3, false);
-        FrameAdapter.getOrCreateStream(clientConnection, 3, false);
         runInChannel(clientChannel, new Http2Runnable() {
             @Override
-            public void run() {
+            public void run() throws Http2Exception {
                 clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, true, newPromiseClient());
-                ctxClient().flush();
+                clientHandler.flush(ctxClient());
             }
         });
         awaitServer();
@@ -137,25 +156,20 @@ public class DataCompressionHttp2Test {
     public void gzipEncodingSingleEmptyMessage() throws Exception {
         final String text = "";
         final ByteBuf data = Unpooled.copiedBuffer(text.getBytes());
-        bootstrapEnv(1, 1, data.readableBytes(), 1);
+        bootstrapEnv(data.readableBytes());
         try {
             final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
                     .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.GZIP);
 
-            // Required because the decompressor intercepts the onXXXRead events before
-            // our {@link Http2TestUtil$FrameAdapter} does.
-            Http2Stream stream = FrameAdapter.getOrCreateStream(serverConnection, 3, false);
-            FrameAdapter.getOrCreateStream(clientConnection, 3, false);
             runInChannel(clientChannel, new Http2Runnable() {
                 @Override
-                public void run() {
+                public void run() throws Http2Exception {
                     clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
                     clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
-                    ctxClient().flush();
+                    clientHandler.flush(ctxClient());
                 }
             });
             awaitServer();
-            assertEquals(0, serverConnection.local().flowController().unconsumedBytes(stream));
             assertEquals(text, serverOut.toString(CharsetUtil.UTF_8.name()));
         } finally {
             data.release();
@@ -166,25 +180,20 @@ public class DataCompressionHttp2Test {
     public void gzipEncodingSingleMessage() throws Exception {
         final String text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccc";
         final ByteBuf data = Unpooled.copiedBuffer(text.getBytes());
-        bootstrapEnv(1, 1, data.readableBytes(), 1);
+        bootstrapEnv(data.readableBytes());
         try {
             final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
                     .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.GZIP);
 
-            // Required because the decompressor intercepts the onXXXRead events before
-            // our {@link Http2TestUtil$FrameAdapter} does.
-            Http2Stream stream = FrameAdapter.getOrCreateStream(serverConnection, 3, false);
-            FrameAdapter.getOrCreateStream(clientConnection, 3, false);
             runInChannel(clientChannel, new Http2Runnable() {
                 @Override
-                public void run() {
+                public void run() throws Http2Exception {
                     clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
                     clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
-                    ctxClient().flush();
+                    clientHandler.flush(ctxClient());
                 }
             });
             awaitServer();
-            assertEquals(0, serverConnection.local().flowController().unconsumedBytes(stream));
             assertEquals(text, serverOut.toString(CharsetUtil.UTF_8.name()));
         } finally {
             data.release();
@@ -197,28 +206,22 @@ public class DataCompressionHttp2Test {
         final String text2 = "dddddddddddddddddddeeeeeeeeeeeeeeeeeeeffffffffffffffffffff";
         final ByteBuf data1 = Unpooled.copiedBuffer(text1.getBytes());
         final ByteBuf data2 = Unpooled.copiedBuffer(text2.getBytes());
-        bootstrapEnv(1, 1, data1.readableBytes() + data2.readableBytes(), 1);
+        bootstrapEnv(data1.readableBytes() + data2.readableBytes());
         try {
             final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
                     .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.GZIP);
 
-            // Required because the decompressor intercepts the onXXXRead events before
-            // our {@link Http2TestUtil$FrameAdapter} does.
-            Http2Stream stream = FrameAdapter.getOrCreateStream(serverConnection, 3, false);
-            FrameAdapter.getOrCreateStream(clientConnection, 3, false);
             runInChannel(clientChannel, new Http2Runnable() {
                 @Override
-                public void run() {
+                public void run() throws Http2Exception {
                     clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
                     clientEncoder.writeData(ctxClient(), 3, data1.retain(), 0, false, newPromiseClient());
                     clientEncoder.writeData(ctxClient(), 3, data2.retain(), 0, true, newPromiseClient());
-                    ctxClient().flush();
+                    clientHandler.flush(ctxClient());
                 }
             });
             awaitServer();
-            assertEquals(0, serverConnection.local().flowController().unconsumedBytes(stream));
-            assertEquals(text1 + text2,
-                    serverOut.toString(CharsetUtil.UTF_8.name()));
+            assertEquals(text1 + text2, serverOut.toString(CharsetUtil.UTF_8.name()));
         } finally {
             data1.release();
             data2.release();
@@ -230,26 +233,21 @@ public class DataCompressionHttp2Test {
         final int BUFFER_SIZE = 1 << 12;
         final byte[] bytes = new byte[BUFFER_SIZE];
         new Random().nextBytes(bytes);
-        bootstrapEnv(1, 1, BUFFER_SIZE, 1);
+        bootstrapEnv(BUFFER_SIZE);
         final ByteBuf data = Unpooled.wrappedBuffer(bytes);
         try {
             final Http2Headers headers = new DefaultHttp2Headers().method(POST).path(PATH)
                     .set(HttpHeaderNames.CONTENT_ENCODING, HttpHeaderValues.DEFLATE);
 
-            // Required because the decompressor intercepts the onXXXRead events before
-            // our {@link Http2TestUtil$FrameAdapter} does.
-            Http2Stream stream = FrameAdapter.getOrCreateStream(serverConnection, 3, false);
-            FrameAdapter.getOrCreateStream(clientConnection, 3, false);
             runInChannel(clientChannel, new Http2Runnable() {
                 @Override
-                public void run() {
+                public void run() throws Http2Exception {
                     clientEncoder.writeHeaders(ctxClient(), 3, headers, 0, false, newPromiseClient());
                     clientEncoder.writeData(ctxClient(), 3, data.retain(), 0, true, newPromiseClient());
-                    ctxClient().flush();
+                    clientHandler.flush(ctxClient());
                 }
             });
             awaitServer();
-            assertEquals(0, serverConnection.local().flowController().unconsumedBytes(stream));
             assertEquals(data.resetReaderIndex().toString(CharsetUtil.UTF_8),
                     serverOut.toString(CharsetUtil.UTF_8.name()));
         } finally {
@@ -257,12 +255,9 @@ public class DataCompressionHttp2Test {
         }
     }
 
-    private void bootstrapEnv(int serverHalfClosedCount, int clientSettingsAckLatchCount,
-            int serverOutSize, int clientCount) throws Exception {
+    private void bootstrapEnv(int serverOutSize) throws Exception {
         serverOut = new ByteArrayOutputStream(serverOutSize);
-        serverLatch = new CountDownLatch(serverHalfClosedCount);
-        clientLatch = new CountDownLatch(clientCount);
-        clientSettingsAckLatch = new CountDownLatch(clientSettingsAckLatchCount);
+        serverLatch = new CountDownLatch(1);
         sb = new ServerBootstrap();
         cb = new Bootstrap();
 
@@ -272,13 +267,7 @@ public class DataCompressionHttp2Test {
 
         serverConnection.addListener(new Http2ConnectionAdapter() {
             @Override
-            public void onStreamActive(Http2Stream stream) {
-                if (stream.state() == State.HALF_CLOSED_LOCAL || stream.state() == State.HALF_CLOSED_REMOTE) {
-                    serverLatch.countDown();
-                }
-            }
-            @Override
-            public void onStreamHalfClosed(Http2Stream stream) {
+            public void onStreamClosed(Http2Stream stream) {
                 serverLatch.countDown();
             }
         });
@@ -291,6 +280,10 @@ public class DataCompressionHttp2Test {
                 int processedBytes = buf.readableBytes() + padding;
 
                 buf.readBytes(serverOut, buf.readableBytes());
+
+                if (in.getArgumentAt(4, Boolean.class)) {
+                    serverConnection.stream(in.getArgumentAt(1, Integer.class)).close();
+                }
                 return processedBytes;
             }
         }).when(serverListener).onDataRead(any(ChannelHandlerContext.class), anyInt(),
@@ -306,10 +299,10 @@ public class DataCompressionHttp2Test {
                 Http2ConnectionEncoder encoder = new CompressorHttp2ConnectionEncoder(
                         new DefaultHttp2ConnectionEncoder(serverConnection, new DefaultHttp2FrameWriter()));
                 Http2ConnectionDecoder decoder =
-                        new DefaultHttp2ConnectionDecoder(serverConnection, encoder, new DefaultHttp2FrameReader(),
-                                new DelegatingDecompressorFrameListener(serverConnection,
-                                        serverListener));
-                Http2ConnectionHandler connectionHandler = new Http2ConnectionHandler(decoder, encoder);
+                        new DefaultHttp2ConnectionDecoder(serverConnection, encoder, new DefaultHttp2FrameReader());
+                Http2ConnectionHandler connectionHandler = new Http2ConnectionHandler.Builder()
+                        .frameListener(new DelegatingDecompressorFrameListener(serverConnection, serverListener))
+                        .build(decoder, encoder);
                 p.addLast(connectionHandler);
                 serverChannelLatch.countDown();
             }
@@ -321,17 +314,17 @@ public class DataCompressionHttp2Test {
             @Override
             protected void initChannel(Channel ch) throws Exception {
                 ChannelPipeline p = ch.pipeline();
-                FrameCountDown clientFrameCountDown = new FrameCountDown(clientListener,
-                        clientSettingsAckLatch, clientLatch);
                 clientEncoder = new CompressorHttp2ConnectionEncoder(
                         new DefaultHttp2ConnectionEncoder(clientConnection, new DefaultHttp2FrameWriter()));
                 Http2ConnectionDecoder decoder =
                         new DefaultHttp2ConnectionDecoder(clientConnection, clientEncoder,
-                                new DefaultHttp2FrameReader(),
-                                new DelegatingDecompressorFrameListener(clientConnection,
-                                        clientFrameCountDown));
-                Http2ConnectionHandler connectionHandler = new Http2ConnectionHandler(decoder, clientEncoder);
-                p.addLast(connectionHandler);
+                                new DefaultHttp2FrameReader());
+                clientHandler = new Http2ConnectionHandler.Builder()
+                        .frameListener(new DelegatingDecompressorFrameListener(clientConnection, clientListener))
+                        // By default tests don't wait for server to gracefully shutdown streams
+                        .gracefulShutdownTimeoutMillis(0)
+                        .build(decoder, clientEncoder);
+                p.addLast(clientHandler);
             }
         });
 
@@ -345,7 +338,6 @@ public class DataCompressionHttp2Test {
     }
 
     private void awaitServer() throws Exception {
-        assertTrue(clientSettingsAckLatch.await(5, SECONDS));
         assertTrue(serverLatch.await(5, SECONDS));
         serverOut.flush();
     }

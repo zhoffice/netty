@@ -14,8 +14,6 @@
  */
 package io.netty.example.http2.helloworld.client;
 
-import static io.netty.handler.logging.LogLevel.INFO;
-
 import io.netty.channel.ChannelHandlerAdapter;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
@@ -27,19 +25,15 @@ import io.netty.handler.codec.http.HttpClientUpgradeHandler;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http2.DefaultHttp2Connection;
-import io.netty.handler.codec.http2.DefaultHttp2FrameReader;
-import io.netty.handler.codec.http2.DefaultHttp2FrameWriter;
 import io.netty.handler.codec.http2.DelegatingDecompressorFrameListener;
 import io.netty.handler.codec.http2.Http2ClientUpgradeCodec;
 import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2FrameLogger;
-import io.netty.handler.codec.http2.Http2FrameReader;
-import io.netty.handler.codec.http2.Http2FrameWriter;
-import io.netty.handler.codec.http2.Http2InboundFrameLogger;
-import io.netty.handler.codec.http2.Http2OutboundFrameLogger;
 import io.netty.handler.codec.http2.HttpToHttp2ConnectionHandler;
 import io.netty.handler.codec.http2.InboundHttp2ToHttpAdapter;
 import io.netty.handler.ssl.SslContext;
+
+import static io.netty.handler.logging.LogLevel.INFO;
 
 /**
  * Configures the client pipeline to support HTTP/2 frames.
@@ -61,15 +55,14 @@ public class Http2ClientInitializer extends ChannelInitializer<SocketChannel> {
     @Override
     public void initChannel(SocketChannel ch) throws Exception {
         final Http2Connection connection = new DefaultHttp2Connection(false);
-        final Http2FrameWriter frameWriter = frameWriter();
-        connectionHandler = new HttpToHttp2ConnectionHandler(connection,
-                frameReader(),
-                frameWriter,
-                new DelegatingDecompressorFrameListener(connection,
+        connectionHandler = new HttpToHttp2ConnectionHandler.Builder()
+                .frameListener(new DelegatingDecompressorFrameListener(connection,
                         new InboundHttp2ToHttpAdapter.Builder(connection)
-                                .maxContentLength(maxContentLength)
-                                .propagateSettings(true)
-                                .build()));
+                            .maxContentLength(maxContentLength)
+                            .propagateSettings(true)
+                            .build()))
+                .frameLogger(logger)
+                .build(connection);
         responseHandler = new HttpResponseHandler();
         settingsHandler = new Http2SettingsHandler(ch.newPromise());
         if (sslCtx != null) {
@@ -88,8 +81,7 @@ public class Http2ClientInitializer extends ChannelInitializer<SocketChannel> {
     }
 
     protected void configureEndOfPipeline(ChannelPipeline pipeline) {
-        pipeline.addLast("Http2SettingsHandler", settingsHandler);
-        pipeline.addLast("HttpResponseHandler", responseHandler);
+        pipeline.addLast(settingsHandler, responseHandler);
     }
 
     /**
@@ -97,8 +89,8 @@ public class Http2ClientInitializer extends ChannelInitializer<SocketChannel> {
      */
     private void configureSsl(SocketChannel ch) {
         ChannelPipeline pipeline = ch.pipeline();
-        pipeline.addLast("SslHandler", sslCtx.newHandler(ch.alloc()));
-        pipeline.addLast("Http2Handler", connectionHandler);
+        pipeline.addLast(sslCtx.newHandler(ch.alloc()),
+                         connectionHandler);
         configureEndOfPipeline(pipeline);
     }
 
@@ -110,10 +102,10 @@ public class Http2ClientInitializer extends ChannelInitializer<SocketChannel> {
         Http2ClientUpgradeCodec upgradeCodec = new Http2ClientUpgradeCodec(connectionHandler);
         HttpClientUpgradeHandler upgradeHandler = new HttpClientUpgradeHandler(sourceCodec, upgradeCodec, 65536);
 
-        ch.pipeline().addLast("Http2SourceCodec", sourceCodec);
-        ch.pipeline().addLast("Http2UpgradeHandler", upgradeHandler);
-        ch.pipeline().addLast("Http2UpgradeRequestHandler", new UpgradeRequestHandler());
-        ch.pipeline().addLast("Logger", new UserEventLogger());
+        ch.pipeline().addLast(sourceCodec,
+                              upgradeHandler,
+                              new UpgradeRequestHandler(),
+                              new UserEventLogger());
     }
 
     /**
@@ -131,7 +123,7 @@ public class Http2ClientInitializer extends ChannelInitializer<SocketChannel> {
             // Done with this handler, remove it from the pipeline.
             ctx.pipeline().remove(this);
 
-            Http2ClientInitializer.this.configureEndOfPipeline(ctx.pipeline());
+            configureEndOfPipeline(ctx.pipeline());
         }
     }
 
@@ -144,13 +136,5 @@ public class Http2ClientInitializer extends ChannelInitializer<SocketChannel> {
             System.out.println("User Event Triggered: " + evt);
             super.userEventTriggered(ctx, evt);
         }
-    }
-
-    private static Http2FrameReader frameReader() {
-        return new Http2InboundFrameLogger(new DefaultHttp2FrameReader(), logger);
-    }
-
-    private static Http2FrameWriter frameWriter() {
-        return new Http2OutboundFrameLogger(new DefaultHttp2FrameWriter(), logger);
     }
 }

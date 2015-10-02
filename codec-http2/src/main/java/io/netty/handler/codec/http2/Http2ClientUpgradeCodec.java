@@ -30,7 +30,7 @@ import io.netty.handler.codec.base64.Base64;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpClientUpgradeHandler;
 import io.netty.handler.codec.http.HttpRequest;
-import io.netty.util.collection.CharObjectHashMap;
+import io.netty.util.collection.CharObjectMap;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -41,7 +41,7 @@ import java.util.List;
  */
 public class Http2ClientUpgradeCodec implements HttpClientUpgradeHandler.UpgradeCodec {
 
-    private static final List<String> UPGRADE_HEADERS = Collections.singletonList(HTTP_UPGRADE_SETTINGS_HEADER);
+    private static final List<CharSequence> UPGRADE_HEADERS = Collections.singletonList(HTTP_UPGRADE_SETTINGS_HEADER);
 
     private final String handlerName;
     private final Http2ConnectionHandler connectionHandler;
@@ -50,33 +50,33 @@ public class Http2ClientUpgradeCodec implements HttpClientUpgradeHandler.Upgrade
      * Creates the codec using a default name for the connection handler when adding to the
      * pipeline.
      *
-     * @param connectionHandler the HTTP/2 connection handler.
+     * @param connectionHandler the HTTP/2 connection handler
      */
     public Http2ClientUpgradeCodec(Http2ConnectionHandler connectionHandler) {
-        this("http2ConnectionHandler", connectionHandler);
+        this(null, connectionHandler);
     }
 
     /**
      * Creates the codec providing an upgrade to the given handler for HTTP/2.
      *
-     * @param handlerName the name of the HTTP/2 connection handler to be used in the pipeline.
-     * @param connectionHandler the HTTP/2 connection handler.
+     * @param handlerName the name of the HTTP/2 connection handler to be used in the pipeline,
+     *                    or {@code null} to auto-generate the name
+     * @param connectionHandler the HTTP/2 connection handler
      */
-    public Http2ClientUpgradeCodec(String handlerName,
-            Http2ConnectionHandler connectionHandler) {
-        this.handlerName = checkNotNull(handlerName, "handlerName");
+    public Http2ClientUpgradeCodec(String handlerName, Http2ConnectionHandler connectionHandler) {
+        this.handlerName = handlerName;
         this.connectionHandler = checkNotNull(connectionHandler, "connectionHandler");
     }
 
     @Override
-    public String protocol() {
+    public CharSequence protocol() {
         return HTTP_UPGRADE_PROTOCOL_NAME;
     }
 
     @Override
-    public Collection<String> setUpgradeHeaders(ChannelHandlerContext ctx,
+    public Collection<CharSequence> setUpgradeHeaders(ChannelHandlerContext ctx,
             HttpRequest upgradeRequest) {
-        String settingsValue = getSettingsHeaderValue(ctx);
+        CharSequence settingsValue = getSettingsHeaderValue(ctx);
         upgradeRequest.headers().set(HTTP_UPGRADE_SETTINGS_HEADER, settingsValue);
         return UPGRADE_HEADERS;
     }
@@ -95,7 +95,7 @@ public class Http2ClientUpgradeCodec implements HttpClientUpgradeHandler.Upgrade
      * Converts the current settings for the handler to the Base64-encoded representation used in
      * the HTTP2-Settings upgrade header.
      */
-    private String getSettingsHeaderValue(ChannelHandlerContext ctx) {
+    private CharSequence getSettingsHeaderValue(ChannelHandlerContext ctx) {
         ByteBuf buf = null;
         ByteBuf encodedBuf = null;
         try {
@@ -105,7 +105,7 @@ public class Http2ClientUpgradeCodec implements HttpClientUpgradeHandler.Upgrade
             // Serialize the payload of the SETTINGS frame.
             int payloadLength = SETTING_ENTRY_LENGTH * settings.size();
             buf = ctx.alloc().buffer(payloadLength);
-            for (CharObjectHashMap.Entry<Long> entry : settings.entries()) {
+            for (CharObjectMap.PrimitiveEntry<Long> entry : settings.entries()) {
                 writeUnsignedShort(entry.key(), buf);
                 writeUnsignedInt(entry.value(), buf);
             }

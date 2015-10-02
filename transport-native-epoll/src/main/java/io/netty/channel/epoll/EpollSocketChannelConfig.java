@@ -22,6 +22,7 @@ import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.socket.SocketChannelConfig;
 import io.netty.util.internal.PlatformDependent;
 
+import java.net.InetAddress;
 import java.util.Map;
 
 import static io.netty.channel.ChannelOption.*;
@@ -49,7 +50,8 @@ public final class EpollSocketChannelConfig extends EpollChannelConfig implement
                 super.getOptions(),
                 SO_RCVBUF, SO_SNDBUF, TCP_NODELAY, SO_KEEPALIVE, SO_REUSEADDR, SO_LINGER, IP_TOS,
                 ALLOW_HALF_CLOSURE, EpollChannelOption.TCP_CORK, EpollChannelOption.TCP_NOTSENT_LOWAT,
-                EpollChannelOption.TCP_KEEPCNT, EpollChannelOption.TCP_KEEPIDLE, EpollChannelOption.TCP_KEEPINTVL);
+                EpollChannelOption.TCP_KEEPCNT, EpollChannelOption.TCP_KEEPIDLE, EpollChannelOption.TCP_KEEPINTVL,
+                EpollChannelOption.TCP_MD5SIG);
     }
 
     @SuppressWarnings("unchecked")
@@ -94,6 +96,9 @@ public final class EpollSocketChannelConfig extends EpollChannelConfig implement
         if (option == EpollChannelOption.TCP_KEEPCNT) {
             return (T) Integer.valueOf(getTcpKeepCnt());
         }
+        if (option == EpollChannelOption.TCP_USER_TIMEOUT) {
+            return (T) Integer.valueOf(getTcpUserTimeout());
+        }
         return super.getOption(option);
     }
 
@@ -127,6 +132,12 @@ public final class EpollSocketChannelConfig extends EpollChannelConfig implement
             setTcpKeepCntl((Integer) value);
         } else if (option == EpollChannelOption.TCP_KEEPINTVL) {
             setTcpKeepIntvl((Integer) value);
+        } else if (option == EpollChannelOption.TCP_USER_TIMEOUT) {
+            setTcpUserTimeout((Integer) value);
+        } else if (option == EpollChannelOption.TCP_MD5SIG) {
+            @SuppressWarnings("unchecked")
+            final Map<InetAddress, byte[]> m = (Map<InetAddress, byte[]>) value;
+            setTcpMd5Sig(m);
         } else {
             return super.setOption(option, value);
         }
@@ -203,6 +214,13 @@ public final class EpollSocketChannelConfig extends EpollChannelConfig implement
      */
     public int getTcpKeepCnt() {
         return Native.getTcpKeepCnt(channel.fd().intValue());
+    }
+
+    /**
+     * Get the {@code TCP_USER_TIMEOUT} option on the socket. See {@code man 7 tcp} for more details.
+     */
+    public int getTcpUserTimeout() {
+        return Native.getTcpUserTimeout(channel.fd().intValue());
     }
 
     @Override
@@ -297,6 +315,24 @@ public final class EpollSocketChannelConfig extends EpollChannelConfig implement
         return this;
     }
 
+    /**
+     * Set the {@code TCP_USER_TIMEOUT} option on the socket. See {@code man 7 tcp} for more details.
+     */
+    public EpollSocketChannelConfig setTcpUserTimeout(int milliseconds) {
+        Native.setTcpUserTimeout(channel.fd().intValue(), milliseconds);
+        return this;
+    }
+
+    /*
+     * Set the {@code TCP_MD5SIG} option on the socket. See {@code linux/tcp.h} for more details.
+     * Keys can only be set on, not read to prevent a potential leak, as they are confidential.
+     * Allowing them being read would mean anyone with access to the channel could get them.
+     */
+    public EpollSocketChannelConfig setTcpMd5Sig(Map<InetAddress, byte[]> keys) {
+        channel.setTcpMd5Sig(keys);
+        return this;
+    }
+
     @Override
     public boolean isAllowHalfClosure() {
         return allowHalfClosure;
@@ -315,6 +351,7 @@ public final class EpollSocketChannelConfig extends EpollChannelConfig implement
     }
 
     @Override
+    @Deprecated
     public EpollSocketChannelConfig setMaxMessagesPerRead(int maxMessagesPerRead) {
         super.setMaxMessagesPerRead(maxMessagesPerRead);
         return this;

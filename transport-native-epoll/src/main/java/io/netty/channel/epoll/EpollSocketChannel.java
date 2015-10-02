@@ -25,8 +25,12 @@ import io.netty.channel.unix.FileDescriptor;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.internal.OneTimeTask;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Map;
 import java.util.concurrent.Executor;
 
 /**
@@ -39,6 +43,7 @@ public final class EpollSocketChannel extends AbstractEpollStreamChannel impleme
 
     private volatile InetSocketAddress local;
     private volatile InetSocketAddress remote;
+    private volatile Collection<InetAddress> tcpMd5SigAddresses = Collections.emptyList();
 
     EpollSocketChannel(Channel parent, int fd, InetSocketAddress remote) {
         super(parent, fd);
@@ -47,6 +52,10 @@ public final class EpollSocketChannel extends AbstractEpollStreamChannel impleme
         // See https://github.com/netty/netty/issues/2359
         this.remote = remote;
         local = Native.localAddress(fd);
+
+        if (parent instanceof EpollServerSocketChannel) {
+            tcpMd5SigAddresses = ((EpollServerSocketChannel) parent).tcpMd5SigAddresses();
+        }
     }
 
     public EpollSocketChannel() {
@@ -197,10 +206,16 @@ public final class EpollSocketChannel extends AbstractEpollStreamChannel impleme
     private final class EpollSocketChannelUnsafe extends EpollStreamUnsafe {
         @Override
         protected Executor closeExecutor() {
-            if (config().getSoLinger() > 0) {
+            // Check isOpen() first as otherwise it will throw a RuntimeException
+            // when call getSoLinger() as the fd is not valid anymore.
+            if (isOpen() && config().getSoLinger() > 0) {
                 return GlobalEventExecutor.INSTANCE;
             }
             return null;
         }
+    }
+
+    void setTcpMd5Sig(Map<InetAddress, byte[]> keys) {
+        this.tcpMd5SigAddresses = TcpMd5Util.newTcpMd5Sigs(this, tcpMd5SigAddresses, keys);
     }
 }

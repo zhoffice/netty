@@ -64,17 +64,22 @@ public abstract class AbstractMemcacheObjectAggregator<H extends MemcacheMessage
     }
 
     @Override
-    protected boolean hasContentLength(H start) throws Exception {
+    protected boolean isContentLengthInvalid(H start, int maxContentLength) {
         return false;
     }
 
     @Override
-    protected long contentLength(H start) throws Exception {
+    protected Object newContinueResponse(H start, int maxContentLength, ChannelPipeline pipeline) {
+        return null;
+    }
+
+    @Override
+    protected boolean closeAfterContinueResponse(Object msg) throws Exception {
         throw new UnsupportedOperationException();
     }
 
     @Override
-    protected Object newContinueResponse(H start) throws Exception {
-        return null;
+    protected boolean ignoreContentAfterContinueResponse(Object msg) throws Exception {
+        throw new UnsupportedOperationException();
     }
 }

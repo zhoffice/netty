@@ -33,9 +33,11 @@ import java.security.KeyException;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
 import java.security.Security;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.security.spec.InvalidKeySpecException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -107,15 +109,18 @@ public abstract class JdkSslContext extends SslContext {
                 "TLS_RSA_WITH_AES_128_CBC_SHA",
                 // AES256 requires JCE unlimited strength jurisdiction policy files.
                 "TLS_RSA_WITH_AES_256_CBC_SHA",
-                "SSL_RSA_WITH_3DES_EDE_CBC_SHA",
-                "SSL_RSA_WITH_RC4_128_SHA");
+                "SSL_RSA_WITH_3DES_EDE_CBC_SHA");
 
-        if (!ciphers.isEmpty()) {
-            DEFAULT_CIPHERS = Collections.unmodifiableList(ciphers);
-        } else {
+        if (ciphers.isEmpty()) {
             // Use the default from JDK as fallback.
-            DEFAULT_CIPHERS = Collections.unmodifiableList(Arrays.asList(engine.getEnabledCipherSuites()));
+            for (String cipher : engine.getEnabledCipherSuites()) {
+                if (cipher.contains("_RC4_")) {
+                    continue;
+                }
+                ciphers.add(cipher);
+            }
         }
+        DEFAULT_CIPHERS = Collections.unmodifiableList(ciphers);
 
         if (logger.isDebugEnabled()) {
             logger.debug("Default protocols (JDK): {} ", Arrays.asList(PROTOCOLS));
@@ -134,14 +139,12 @@ public abstract class JdkSslContext extends SslContext {
     private final String[] cipherSuites;
     private final List<String> unmodifiableCipherSuites;
     private final JdkApplicationProtocolNegotiator apn;
+    private final ClientAuth clientAuth;
 
-    JdkSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter, ApplicationProtocolConfig config,
-            boolean isServer) {
-        this(ciphers, cipherFilter, toNegotiator(config, isServer));
-    }
-
-    JdkSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter, JdkApplicationProtocolNegotiator apn) {
+    JdkSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter, JdkApplicationProtocolNegotiator apn,
+                  ClientAuth clientAuth) {
         this.apn = checkNotNull(apn, "apn");
+        this.clientAuth = checkNotNull(clientAuth, "clientAuth");
         cipherSuites = checkNotNull(cipherFilter, "cipherFilter").filterCipherSuites(
                 ciphers, DEFAULT_CIPHERS, SUPPORTED_CIPHERS);
         unmodifiableCipherSuites = Collections.unmodifiableList(Arrays.asList(cipherSuites));
@@ -181,23 +184,28 @@ public abstract class JdkSslContext extends SslContext {
 
     @Override
     public final SSLEngine newEngine(ByteBufAllocator alloc) {
-        SSLEngine engine = context().createSSLEngine();
-        engine.setEnabledCipherSuites(cipherSuites);
-        engine.setEnabledProtocols(PROTOCOLS);
-        engine.setUseClientMode(isClient());
-        return wrapEngine(engine);
+        return configureAndWrapEngine(context().createSSLEngine());
     }
 
     @Override
     public final SSLEngine newEngine(ByteBufAllocator alloc, String peerHost, int peerPort) {
-        SSLEngine engine = context().createSSLEngine(peerHost, peerPort);
+        return configureAndWrapEngine(context().createSSLEngine(peerHost, peerPort));
+    }
+
+    private SSLEngine configureAndWrapEngine(SSLEngine engine) {
         engine.setEnabledCipherSuites(cipherSuites);
         engine.setEnabledProtocols(PROTOCOLS);
         engine.setUseClientMode(isClient());
-        return wrapEngine(engine);
-    }
-
-    private SSLEngine wrapEngine(SSLEngine engine) {
+        if (isServer()) {
+            switch (clientAuth) {
+                case OPTIONAL:
+                    engine.setWantClientAuth(true);
+                    break;
+                case REQUIRE:
+                    engine.setNeedClientAuth(true);
+                    break;
+            }
+        }
         return apn.wrapperFactory().wrapSslEngine(engine, apn, isServer());
     }
 
@@ -278,7 +286,9 @@ public abstract class JdkSslContext extends SslContext {
      *                    {@code null} if it's not password-protected.
      * @param kmf The existing {@link KeyManagerFactory} that will be used if not {@code null}
      * @return A {@link KeyManagerFactory} based upon a key file, key file password, and a certificate chain.
+     * @deprecated will be removed.
      */
+    @Deprecated
     protected static KeyManagerFactory buildKeyManagerFactory(File certChainFile, File keyFile, String keyPassword,
             KeyManagerFactory kmf)
                     throws UnrecoverableKeyException, KeyStoreException, NoSuchAlgorithmException,
@@ -289,6 +299,17 @@ public abstract class JdkSslContext extends SslContext {
             algorithm = "SunX509";
         }
         return buildKeyManagerFactory(certChainFile, algorithm, keyFile, keyPassword, kmf);
+    }
+
+    static KeyManagerFactory buildKeyManagerFactory(X509Certificate[] certChain, PrivateKey key, String keyPassword,
+                                                              KeyManagerFactory kmf)
+            throws UnrecoverableKeyException, KeyStoreException, NoSuchAlgorithmException,
+                   CertificateException, IOException {
+        String algorithm = Security.getProperty("ssl.KeyManagerFactory.algorithm");
+        if (algorithm == null) {
+            algorithm = "SunX509";
+        }
+        return buildKeyManagerFactory(certChain, algorithm, key, keyPassword, kmf);
     }
 
     /**
@@ -303,14 +324,25 @@ public abstract class JdkSslContext extends SslContext {
      * @param kmf The existing {@link KeyManagerFactory} that will be used if not {@code null}
      * @return A {@link KeyManagerFactory} based upon a key algorithm, key file, key file password,
      * and a certificate chain.
+     * @deprecated will be removed.
      */
+    @Deprecated
     protected static KeyManagerFactory buildKeyManagerFactory(File certChainFile,
             String keyAlgorithm, File keyFile, String keyPassword, KeyManagerFactory kmf)
                     throws KeyStoreException, NoSuchAlgorithmException, NoSuchPaddingException,
                     InvalidKeySpecException, InvalidAlgorithmParameterException, IOException,
                     CertificateException, KeyException, UnrecoverableKeyException {
+        return buildKeyManagerFactory(toX509Certificates(certChainFile), keyAlgorithm,
+                                      toPrivateKey(keyFile, keyPassword), keyPassword, kmf);
+    }
+
+    static KeyManagerFactory buildKeyManagerFactory(X509Certificate[] certChainFile,
+                                                              String keyAlgorithm, PrivateKey key,
+                                                              String keyPassword, KeyManagerFactory kmf)
+            throws KeyStoreException, NoSuchAlgorithmException, IOException,
+                   CertificateException, UnrecoverableKeyException {
         char[] keyPasswordChars = keyPassword == null ? EmptyArrays.EMPTY_CHARS : keyPassword.toCharArray();
-        KeyStore ks = buildKeyStore(certChainFile, keyFile, keyPasswordChars);
+        KeyStore ks = buildKeyStore(certChainFile, key, keyPasswordChars);
         // Set up key manager factory to use our key store
         if (kmf == null) {
             kmf = KeyManagerFactory.getInstance(keyAlgorithm);

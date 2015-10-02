@@ -84,7 +84,7 @@
           <plugin>
             <groupId>org.jacoco</groupId>
             <artifactId>jacoco-maven-plugin</artifactId>
-            <version>0.7.1.201405082137</version>
+            <version>0.7.5.201505241946</version>
             <executions>
               <execution>
                 <id>jacoco-prepare-agent</id>
@@ -149,7 +149,7 @@
                         Release process must be performed on linux-x86_64.
                       </regexMessage>
                       <property>os.detected.classifier</property>
-                      <regex>^linux-x86_64$</regex>
+                      <regex>^linux-x86_64-fedora$</regex>
                     </requireProperty>
                     <requireFilesContent>
                       <message>
@@ -175,28 +175,31 @@
       See: http://www.eclipse.org/jetty/documentation/current/alpn-chapter.html#alpn-versions
     -->
     <profile>
-      <id>npn-alpn-7</id>
+      <id>alpn-7latest</id>
       <activation>
-        <property>
-          <name>java.version</name>
-          <value>1.7</value>
-        </property>
+        <jdk>[1.7,1.8)</jdk>
       </activation>
       <properties>
-        <jetty.npn.version>${jetty.npn.version.latest}</jetty.npn.version>
-        <jetty.alpn.version>${jetty.alpn.version.latest7}</jetty.alpn.version>
+        <jetty.alpn.version>7.1.3.v20150130</jetty.alpn.version>
       </properties>
     </profile>
     <profile>
-      <id>alpn-8</id>
+      <id>npn-latest</id>
       <activation>
-        <property>
-          <name>java.version</name>
-          <value>1.8</value>
-        </property>
+        <!--Even though npn is only supported on 1.7, allow it to still be included so dependencies can be resolved-->
+        <jdk>[1.7,)</jdk>
       </activation>
       <properties>
-        <jetty.alpn.version>${jetty.alpn.version.latest8}</jetty.alpn.version>
+        <jetty.npn.version>1.1.11.v20150415</jetty.npn.version>
+      </properties>
+    </profile>
+    <profile>
+      <id>alpn-8latest</id>
+      <activation>
+        <jdk>[1.8,)</jdk>
+      </activation>
+      <properties>
+        <jetty.alpn.version>8.1.4.v20150727</jetty.alpn.version>
       </properties>
     </profile>
     <profile>
@@ -460,7 +463,7 @@
         </property>
       </activation>
       <properties>
-        <jetty.npn.version>1.1.10.v20150130</jetty.npn.version>
+        <jetty.npn.version>1.1.11.v20150415</jetty.npn.version>
         <jetty.alpn.version>7.1.3.v20150130</jetty.alpn.version>
       </properties>
     </profile>
@@ -549,6 +552,18 @@
       </properties>
     </profile>
     <profile>
+      <id>alpn-8u51</id>
+      <activation>
+        <property>
+          <name>java.version</name>
+          <value>1.8.0_51</value>
+        </property>
+      </activation>
+      <properties>
+        <jetty.alpn.version>8.1.4.v20150727</jetty.alpn.version>
+      </properties>
+    </profile>
+    <profile>
       <!--
       This profile exists because either ALPN or NPN can exits on the class path at once, but not both.
       The JDK version is typically used to distinguish which should be used but there is some overlap
@@ -571,12 +586,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     <jboss.marshalling.version>1.3.18.GA</jboss.marshalling.version>
-    <jetty.npn.version.latest>1.1.10.v20150130</jetty.npn.version.latest>
-    <jetty.alpn.version.latest7>7.1.3.v20150130</jetty.alpn.version.latest7>
-    <jetty.alpn.version.latest8>8.1.3.v20150130</jetty.alpn.version.latest8>
-    <jetty.npn.version>${jetty.npn.version.latest}</jetty.npn.version>
     <jetty.npn.path>${settings.localRepository}/org/mortbay/jetty/npn/npn-boot/${jetty.npn.version}/npn-boot-${jetty.npn.version}.jar</jetty.npn.path>
-    <jetty.alpn.version>${jetty.alpn.version.latest7}</jetty.alpn.version>
     <jetty.alpn.path>${settings.localRepository}/org/mortbay/jetty/alpn/alpn-boot/${jetty.alpn.version}/alpn-boot-${jetty.alpn.version}.jar</jetty.alpn.path>
     <argLine.common>
       -server
@@ -592,6 +602,11 @@
     <argLine.bootcp>-Xbootclasspath/p:${jetty.alpn.path}</argLine.bootcp>
     <argLine.leak>-D_</argLine.leak> <!-- Overridden when 'leak' profile is active -->
     <argLine.coverage>-D_</argLine.coverage> <!-- Overridden when 'coverage' profile is active -->
+    <!-- Configure the os-maven-plugin extension to expand the classifier on                  -->
+    <!-- Fedora-"like" systems. This is currently only used for the netty-tcnative dependency -->
+    <os.detection.classifierWithLikes>fedora</os.detection.classifierWithLikes>
+    <tcnative.classifier>${os.detected.classifier}</tcnative.classifier>
+    <epoll.classifier>${os.detected.name}-${os.detected.arch}</epoll.classifier>
   </properties>
 
   <modules>
@@ -647,7 +662,7 @@
       <dependency>
         <groupId>com.twitter</groupId>
         <artifactId>hpack</artifactId>
-        <version>0.11.0</version>
+        <version>v1.0.1</version>
       </dependency>
       <dependency>
         <groupId>org.eclipse.jetty.npn</groupId>
@@ -681,8 +696,8 @@
       <dependency>
         <groupId>${project.groupId}</groupId>
         <artifactId>netty-tcnative</artifactId>
-        <version>1.1.33.Fork2</version>
-        <classifier>${os.detected.classifier}</classifier>
+        <version>1.1.33.Fork9</version>
+        <classifier>${tcnative.classifier}</classifier>
         <scope>compile</scope>
         <optional>true</optional>
       </dependency>
@@ -927,7 +942,7 @@
       <extension>
         <groupId>kr.motd.maven</groupId>
         <artifactId>os-maven-plugin</artifactId>
-        <version>1.2.3.Final</version>
+        <version>1.4.1.Final</version>
       </extension>
     </extensions>
 
@@ -1148,16 +1163,40 @@
           </execution>
         </executions>
       </plugin>
+
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <version>1.8</version>
+        <executions>
+          <execution>
+            <id>parse-version</id>
+            <goals>
+              <goal>parse-version</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
       <plugin>
         <artifactId>maven-source-plugin</artifactId>
         <version>2.2.1</version>
+        <!-- Eclipse-related OSGi manifests
+             See https://github.com/netty/netty/issues/3886
+             More information: http://rajakannappan.blogspot.ie/2010/03/automating-eclipse-source-bundle.html -->
         <configuration>
-          <!--
-            ~ Add generated MANIFEST.MF.
-            ~ See https://github.com/netty/netty/issues/2058
-          -->
-          <useDefaultManifestFile>true</useDefaultManifestFile>
+          <archive>
+            <manifestEntries>
+              <Bundle-ManifestVersion>2</Bundle-ManifestVersion>
+              <Bundle-Name>${name}</Bundle-Name>
+              <Bundle-SymbolicName>${groupId}.${artifactId}.source</Bundle-SymbolicName>
+              <Bundle-Vendor>${organization.name}</Bundle-Vendor>
+              <Bundle-Version>${parsedVersion.osgiVersion}</Bundle-Version>
+              <Eclipse-SourceBundle>${groupId}.${artifactId};version="${parsedVersion.osgiVersion}";roots:="."</Eclipse-SourceBundle>
+            </manifestEntries>
+          </archive>
         </configuration>
+
         <executions>
           <!--
             ~ This workaround prevents Maven from executing the 'generate-sources' phase twice.

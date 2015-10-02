@@ -19,6 +19,7 @@ package io.netty.channel.epoll;
 import io.netty.channel.ChannelException;
 import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.unix.DomainSocketAddress;
+import io.netty.util.CharsetUtil;
 import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.NativeLibraryLoader;
 import io.netty.util.internal.PlatformDependent;
@@ -60,7 +61,10 @@ public final class Native {
     public static final int IOV_MAX = iovMax();
     public static final int UIO_MAX_IOV = uioMaxIov();
     public static final boolean IS_SUPPORTING_SENDMMSG = isSupportingSendmmsg();
+    public static final boolean IS_SUPPORTING_TCP_FASTOPEN = isSupportingTcpFastopen();
     public static final long SSIZE_MAX = ssizeMax();
+    public static final int TCP_MD5SIG_MAXKEYLEN = tcpMd5SigMaxKeyLen();
+
     private static final byte[] IPV4_MAPPED_IPV6_PREFIX = {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, (byte) 0xff, (byte) 0xff };
 
@@ -201,7 +205,7 @@ public final class Native {
 
     private static native int close0(int fd);
 
-    public static int splice(int fd, int offIn, int fdOut, int offOut, int len) throws IOException {
+    public static int splice(int fd, long offIn, int fdOut, long offOut, long len) throws IOException {
         int res = splice0(fd, offIn, fdOut, offOut, len);
         if (res >= 0) {
             return res;
@@ -209,7 +213,7 @@ public final class Native {
         return ioResult("splice", res, CONNECTION_RESET_EXCEPTION_SPLICE);
     }
 
-    private static native int splice0(int fd, int offIn, int fdOut, int offOut, int len);
+    private static native int splice0(int fd, long offIn, int fdOut, long offOut, long len);
 
     public static long pipe() throws IOException {
         long res = pipe0();
@@ -395,6 +399,7 @@ public final class Native {
             int fd, NativeDatagramPacketArray.NativeDatagramPacket[] msgs, int offset, int len);
 
     private static native boolean isSupportingSendmmsg();
+    private static native boolean isSupportingTcpFastopen();
 
     // socket operations
     public static int socketStreamFd() {
@@ -435,7 +440,7 @@ public final class Native {
             }
         } else if (socketAddress instanceof DomainSocketAddress) {
             DomainSocketAddress addr = (DomainSocketAddress) socketAddress;
-            int res = bindDomainSocket(fd, addr.path());
+            int res = bindDomainSocket(fd, addr.path().getBytes(CharsetUtil.UTF_8));
             if (res < 0) {
                 throw newIOException("bind", res);
             }
@@ -445,7 +450,7 @@ public final class Native {
     }
 
     private static native int bind(int fd, byte[] address, int scopeId, int port);
-    private static native int bindDomainSocket(int fd, String path);
+    private static native int bindDomainSocket(int fd, byte[] path);
 
     public static void listen(int fd, int backlog) throws IOException {
         int res = listen0(fd, backlog);
@@ -464,7 +469,7 @@ public final class Native {
             res = connect(fd, address.address, address.scopeId, inetSocketAddress.getPort());
         } else if (socketAddress instanceof DomainSocketAddress) {
             DomainSocketAddress unixDomainSocketAddress = (DomainSocketAddress) socketAddress;
-            res = connectDomainSocket(fd, unixDomainSocketAddress.path());
+            res = connectDomainSocket(fd, unixDomainSocketAddress.path().getBytes(CharsetUtil.UTF_8));
         } else {
             throw new Error("Unexpected SocketAddress implementation " + socketAddress);
         }
@@ -479,7 +484,7 @@ public final class Native {
     }
 
     private static native int connect(int fd, byte[] address, int scopeId, int port);
-    private static native int connectDomainSocket(int fd, String path);
+    private static native int connectDomainSocket(int fd, byte[] path);
 
     public static boolean finishConnect(int fd) throws IOException {
         int res = finishConnect0(fd);
@@ -634,7 +639,9 @@ public final class Native {
     public static native int getTcpKeepIdle(int fd);
     public static native int getTcpKeepIntvl(int fd);
     public static native int getTcpKeepCnt(int fd);
+    public static native int getTcpUserTimeout(int milliseconds);
     public static native int getSoError(int fd);
+    public static native int isIpFreeBind(int fd);
 
     public static native void setKeepAlive(int fd, int keepAlive);
     public static native void setReceiveBufferSize(int fd, int receiveBufferSize);
@@ -643,6 +650,7 @@ public final class Native {
     public static native void setSendBufferSize(int fd, int sendBufferSize);
     public static native void setTcpNoDelay(int fd, int tcpNoDelay);
     public static native void setTcpCork(int fd, int tcpCork);
+    public static native void setTcpFastopen(int fd, int tcpFastopenBacklog);
     public static native void setTcpNotSentLowAt(int fd, int tcpNotSentLowAt);
     public static native void setSoLinger(int fd, int soLinger);
     public static native void setTrafficClass(int fd, int tcpNoDelay);
@@ -650,12 +658,20 @@ public final class Native {
     public static native void setTcpKeepIdle(int fd, int seconds);
     public static native void setTcpKeepIntvl(int fd, int seconds);
     public static native void setTcpKeepCnt(int fd, int probes);
-
+    public static native void setTcpUserTimeout(int fd, int milliseconds);
+    public static native void setIpFreeBind(int fd, int freeBind);
     public static void tcpInfo(int fd, EpollTcpInfo info) {
         tcpInfo0(fd, info.info);
     }
 
     private static native void tcpInfo0(int fd, int[] array);
+
+    public static void setTcpMd5Sig(int fd, InetAddress address, byte[] key) {
+        final NativeInetAddress a = toNativeInetAddress(address);
+        setTcpMd5Sig0(fd, a.address, a.scopeId, key);
+    }
+
+    private static native void setTcpMd5Sig0(int fd, byte[] address, int scopeId, byte[] key);
 
     private static NativeInetAddress toNativeInetAddress(InetAddress addr) {
         byte[] bytes = addr.getAddress();
@@ -705,6 +721,8 @@ public final class Native {
     private static native int epollerr();
 
     private static native long ssizeMax();
+    private static native int tcpMd5SigMaxKeyLen();
+
     private Native() {
         // utility
     }

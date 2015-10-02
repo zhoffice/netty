@@ -28,6 +28,7 @@ import org.apache.tomcat.jni.SSL;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLParameters;
@@ -36,7 +37,6 @@ import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSessionBindingEvent;
 import javax.net.ssl.SSLSessionBindingListener;
 import javax.net.ssl.SSLSessionContext;
-import javax.security.cert.CertificateException;
 import javax.security.cert.X509Certificate;
 import java.nio.ByteBuffer;
 import java.nio.ReadOnlyBufferException;
@@ -110,12 +110,6 @@ public final class OpenSslEngine extends SSLEngine {
 
     static final int MAX_ENCRYPTION_OVERHEAD_LENGTH = MAX_ENCRYPTED_PACKET_LENGTH - MAX_PLAINTEXT_LENGTH;
 
-    enum ClientAuthMode {
-        NONE,
-        OPTIONAL,
-        REQUIRE,
-    }
-
     private static final AtomicIntegerFieldUpdater<OpenSslEngine> DESTROYED_UPDATER;
 
     private static final String INVALID_CIPHER = "SSL_NULL_WITH_NULL_NULL";
@@ -132,23 +126,32 @@ public final class OpenSslEngine extends SSLEngine {
     private long ssl;
     private long networkBIO;
 
-    /**
-     * 0 - not accepted, 1 - accepted implicitly via wrap()/unwrap(), 2 - accepted explicitly via beginHandshake() call
-     */
-    private int accepted;
-    private boolean handshakeFinished;
+    private enum HandshakeState {
+        /**
+         * Not started yet.
+         */
+        NOT_STARTED,
+        /**
+         * Started via unwrap/wrap.
+         */
+        STARTED_IMPLICITLY,
+        /**
+         * Started via {@link #beginHandshake()}.
+         */
+        STARTED_EXPLICITLY,
+
+        /**
+         * Handshake is finished.
+         */
+        FINISHED
+    }
+
+    private HandshakeState handshakeState = HandshakeState.NOT_STARTED;
     private boolean receivedShutdown;
     @SuppressWarnings("UnusedDeclaration")
     private volatile int destroyed;
 
-    // Use an invalid cipherSuite until the handshake is completed
-    // See http://docs.oracle.com/javase/7/docs/api/javax/net/ssl/SSLEngine.html#getSession()
-    private volatile String cipher;
-    private volatile String applicationProtocol;
-
-    // We store this outside of the SslSession so we not need to create an instance during verifyCertificates(...)
-    private volatile Certificate[] peerCerts;
-    private volatile ClientAuthMode clientAuth = ClientAuthMode.NONE;
+    private volatile ClientAuth clientAuth = ClientAuth.NONE;
 
     private volatile String endPointIdentificationAlgorithm;
     // Store as object as AlgorithmConstraints only exists since java 7.
@@ -161,11 +164,11 @@ public final class OpenSslEngine extends SSLEngine {
 
     private final boolean clientMode;
     private final ByteBufAllocator alloc;
-    private final OpenSslSessionContext sessionContext;
     private final OpenSslEngineMap engineMap;
     private final OpenSslApplicationProtocolNegotiator apn;
     private final boolean rejectRemoteInitiatedRenegation;
-    private final SSLSession session = new OpenSslSession();
+    private final OpenSslSession session;
+    private final java.security.cert.Certificate[] localCerts;
 
     // This is package-private as we set it from OpenSslContext if an exception is thrown during
     // the verification step.
@@ -180,28 +183,25 @@ public final class OpenSslEngine extends SSLEngine {
     @Deprecated
     public OpenSslEngine(long sslCtx, ByteBufAllocator alloc,
                          @SuppressWarnings("unused") String fallbackApplicationProtocol) {
-        this(sslCtx, alloc, false, null, OpenSslContext.NONE_PROTOCOL_NEGOTIATOR, OpenSslEngineMap.EMPTY, false);
-    }
-
-    /**
-     * Creates a new instance
-     *
-     * @param sslCtx an OpenSSL {@code SSL_CTX} object
-     * @param alloc the {@link ByteBufAllocator} that will be used by this engine
-     * @param clientMode {@code true} if this is used for clients, {@code false} otherwise
-     * @param sessionContext the {@link OpenSslSessionContext} this {@link SSLEngine} belongs to.
-     */
-    OpenSslEngine(long sslCtx, ByteBufAllocator alloc,
-                  boolean clientMode, OpenSslSessionContext sessionContext,
-                  OpenSslApplicationProtocolNegotiator apn, OpenSslEngineMap engineMap,
-                  boolean rejectRemoteInitiatedRenegation) {
-        this(sslCtx, alloc, clientMode, sessionContext, apn, engineMap, rejectRemoteInitiatedRenegation, null, -1);
+        this(sslCtx, alloc, false, null, OpenSslContext.NONE_PROTOCOL_NEGOTIATOR, OpenSslEngineMap.EMPTY, false,
+                ClientAuth.NONE);
     }
 
     OpenSslEngine(long sslCtx, ByteBufAllocator alloc,
                   boolean clientMode, OpenSslSessionContext sessionContext,
                   OpenSslApplicationProtocolNegotiator apn, OpenSslEngineMap engineMap,
-                  boolean rejectRemoteInitiatedRenegation, String peerHost, int peerPort) {
+                  boolean rejectRemoteInitiatedRenegation,
+                  ClientAuth clientAuth) {
+        this(sslCtx, alloc, clientMode, sessionContext, apn, engineMap, rejectRemoteInitiatedRenegation, null, -1,
+                null, clientAuth);
+    }
+
+    OpenSslEngine(long sslCtx, ByteBufAllocator alloc,
+                  boolean clientMode, OpenSslSessionContext sessionContext,
+                  OpenSslApplicationProtocolNegotiator apn, OpenSslEngineMap engineMap,
+                  boolean rejectRemoteInitiatedRenegation, String peerHost, int peerPort,
+                  java.security.cert.Certificate[] localCerts,
+                  ClientAuth clientAuth) {
         super(peerHost, peerPort);
         OpenSsl.ensureAvailability();
         if (sslCtx == 0) {
@@ -210,17 +210,19 @@ public final class OpenSslEngine extends SSLEngine {
 
         this.alloc = checkNotNull(alloc, "alloc");
         this.apn = checkNotNull(apn, "apn");
+        this.clientAuth = clientMode ? ClientAuth.NONE : checkNotNull(clientAuth, "clientAuth");
         ssl = SSL.newSSL(sslCtx, !clientMode);
+        session = new OpenSslSession(ssl, sessionContext);
         networkBIO = SSL.makeNetworkBIO(ssl);
         this.clientMode = clientMode;
-        this.sessionContext = sessionContext;
         this.engineMap = engineMap;
         this.rejectRemoteInitiatedRenegation = rejectRemoteInitiatedRenegation;
+        this.localCerts = localCerts;
     }
 
     @Override
     public SSLSession getHandshakeSession() {
-        if (accepted > 0) {
+        if (handshakeState != HandshakeState.NOT_STARTED) {
             // handshake started we are able to return the session.
             return session;
         }
@@ -250,6 +252,9 @@ public final class OpenSslEngine extends SSLEngine {
             // internal errors can cause shutdown without marking the engine closed
             isInboundDone = isOutboundDone = engineClosed = true;
         }
+
+        // On shutdown clear all errors
+        SSL.clearError();
     }
 
     /**
@@ -268,7 +273,6 @@ public final class OpenSslEngine extends SSLEngine {
             sslWrote = SSL.writeToSSL(ssl, addr, len);
             if (sslWrote > 0) {
                 src.position(pos + sslWrote);
-                return sslWrote;
             }
         } else {
             ByteBuf buf = alloc.directBuffer(len);
@@ -283,7 +287,6 @@ public final class OpenSslEngine extends SSLEngine {
                 sslWrote = SSL.writeToSSL(ssl, addr, len);
                 if (sslWrote > 0) {
                     src.position(pos + sslWrote);
-                    return sslWrote;
                 } else {
                     src.position(pos);
                 }
@@ -291,8 +294,7 @@ public final class OpenSslEngine extends SSLEngine {
                 buf.release();
             }
         }
-
-        throw new IllegalStateException("SSL.writeToSSL() returned a non-positive value: " + sslWrote);
+        return sslWrote;
     }
 
     /**
@@ -301,12 +303,12 @@ public final class OpenSslEngine extends SSLEngine {
     private int writeEncryptedData(final ByteBuffer src) {
         final int pos = src.position();
         final int len = src.remaining();
+        final int netWrote;
         if (src.isDirect()) {
             final long addr = Buffer.address(src) + pos;
-            final int netWrote = SSL.writeToBIO(networkBIO, addr, len);
+            netWrote = SSL.writeToBIO(networkBIO, addr, len);
             if (netWrote >= 0) {
                 src.position(pos + netWrote);
-                return netWrote;
             }
         } else {
             final ByteBuf buf = alloc.directBuffer(len);
@@ -315,10 +317,9 @@ public final class OpenSslEngine extends SSLEngine {
 
                 buf.setBytes(0, src);
 
-                final int netWrote = SSL.writeToBIO(networkBIO, addr, len);
+                netWrote = SSL.writeToBIO(networkBIO, addr, len);
                 if (netWrote >= 0) {
                     src.position(pos + netWrote);
-                    return netWrote;
                 } else {
                     src.position(pos);
                 }
@@ -327,21 +328,21 @@ public final class OpenSslEngine extends SSLEngine {
             }
         }
 
-        return -1;
+        return netWrote;
     }
 
     /**
      * Read plaintext data from the OpenSSL internal BIO
      */
     private int readPlaintextData(final ByteBuffer dst) {
+        final int sslRead;
         if (dst.isDirect()) {
             final int pos = dst.position();
             final long addr = Buffer.address(dst) + pos;
             final int len = dst.limit() - pos;
-            final int sslRead = SSL.readFromSSL(ssl, addr, len);
+            sslRead = SSL.readFromSSL(ssl, addr, len);
             if (sslRead > 0) {
                 dst.position(pos + sslRead);
-                return sslRead;
             }
         } else {
             final int pos = dst.position();
@@ -351,29 +352,30 @@ public final class OpenSslEngine extends SSLEngine {
             try {
                 final long addr = memoryAddress(buf);
 
-                final int sslRead = SSL.readFromSSL(ssl, addr, len);
+                sslRead = SSL.readFromSSL(ssl, addr, len);
                 if (sslRead > 0) {
                     dst.limit(pos + sslRead);
                     buf.getBytes(0, dst);
                     dst.limit(limit);
-                    return sslRead;
                 }
             } finally {
                 buf.release();
             }
         }
 
-        return 0;
+        return sslRead;
     }
 
     /**
      * Read encrypted data from the OpenSSL network BIO
      */
     private int readEncryptedData(final ByteBuffer dst, final int pending) {
+        final int bioRead;
+
         if (dst.isDirect() && dst.remaining() >= pending) {
             final int pos = dst.position();
             final long addr = Buffer.address(dst) + pos;
-            final int bioRead = SSL.readFromBIO(networkBIO, addr, pending);
+            bioRead = SSL.readFromBIO(networkBIO, addr, pending);
             if (bioRead > 0) {
                 dst.position(pos + bioRead);
                 return bioRead;
@@ -383,7 +385,7 @@ public final class OpenSslEngine extends SSLEngine {
             try {
                 final long addr = memoryAddress(buf);
 
-                final int bioRead = SSL.readFromBIO(networkBIO, addr, pending);
+                bioRead = SSL.readFromBIO(networkBIO, addr, pending);
                 if (bioRead > 0) {
                     int oldLimit = dst.limit();
                     dst.limit(dst.position() + bioRead);
@@ -396,7 +398,46 @@ public final class OpenSslEngine extends SSLEngine {
             }
         }
 
-        return 0;
+        return bioRead;
+    }
+
+    private SSLEngineResult readPendingBytesFromBIO(
+            ByteBuffer dst, int bytesConsumed, int bytesProduced, HandshakeStatus status) throws SSLException {
+        // Check to see if the engine wrote data into the network BIO
+        int pendingNet = SSL.pendingWrittenBytesInBIO(networkBIO);
+        if (pendingNet > 0) {
+
+            // Do we have enough room in dst to write encrypted data?
+            int capacity = dst.remaining();
+            if (capacity < pendingNet) {
+                return new SSLEngineResult(BUFFER_OVERFLOW,
+                        mayFinishHandshake(status != FINISHED ? getHandshakeStatus(pendingNet) : status),
+                                           bytesConsumed, bytesProduced);
+            }
+
+            // Write the pending data from the network BIO into the dst buffer
+            int produced = readEncryptedData(dst, pendingNet);
+
+            if (produced <= 0) {
+                // We ignore BIO_* errors here as we use in memory BIO anyway and will do another SSL_* call later
+                // on in which we will produce an exception in case of an error
+                SSL.clearError();
+            } else {
+                bytesProduced += produced;
+                pendingNet -= produced;
+            }
+            // If isOuboundDone is set, then the data from the network BIO
+            // was the close_notify message -- we are not required to wait
+            // for the receipt the peer's close_notify message -- shutdown.
+            if (isOutboundDone) {
+                shutdown();
+            }
+
+            return new SSLEngineResult(getEngineStatus(),
+                                       mayFinishHandshake(status != FINISHED ? getHandshakeStatus(pendingNet) : status),
+                                       bytesConsumed, bytesProduced);
+        }
+        return null;
     }
 
     @Override
@@ -404,7 +445,7 @@ public final class OpenSslEngine extends SSLEngine {
             final ByteBuffer[] srcs, final int offset, final int length, final ByteBuffer dst) throws SSLException {
 
         // Check to make sure the engine has not been closed
-        if (destroyed != 0) {
+        if (isDestroyed()) {
             return CLOSED_NOT_HANDSHAKING;
         }
 
@@ -426,52 +467,25 @@ public final class OpenSslEngine extends SSLEngine {
             throw new ReadOnlyBufferException();
         }
 
+        HandshakeStatus status = NOT_HANDSHAKING;
         // Prepare OpenSSL to work in server mode and receive handshake
-        if (accepted == 0) {
-            beginHandshakeImplicitly();
-        }
+        if (handshakeState != HandshakeState.FINISHED) {
+            if (handshakeState != HandshakeState.STARTED_EXPLICITLY) {
+                // Update accepted so we know we triggered the handshake via wrap
+                handshakeState = HandshakeState.STARTED_IMPLICITLY;
+            }
 
-        // In handshake or close_notify stages, check if call to wrap was made
-        // without regard to the handshake status.
-        SSLEngineResult.HandshakeStatus handshakeStatus = handshakeStatus0();
-
-        if (handshakeStatus == NEED_UNWRAP) {
-            if (!handshakeFinished) {
+            status = handshake();
+            if (status == NEED_UNWRAP) {
                 return NEED_UNWRAP_OK;
             }
+
             if (engineClosed) {
                 return NEED_UNWRAP_CLOSED;
             }
         }
 
         int bytesProduced = 0;
-        int pendingNet;
-
-        // Check for pending data in the network BIO
-        pendingNet = SSL.pendingWrittenBytesInBIO(networkBIO);
-        if (pendingNet > 0) {
-            // Do we have enough room in dst to write encrypted data?
-            int capacity = dst.remaining();
-            if (capacity < pendingNet) {
-                return new SSLEngineResult(BUFFER_OVERFLOW, handshakeStatus, 0, bytesProduced);
-            }
-
-            // Write the pending data from the network BIO into the dst buffer
-            try {
-                bytesProduced += readEncryptedData(dst, pendingNet);
-            } catch (Exception e) {
-                throw new SSLException(e);
-            }
-
-            // If isOuboundDone is set, then the data from the network BIO
-            // was the close_notify message -- we are not required to wait
-            // for the receipt the peer's close_notify message -- shutdown.
-            if (isOutboundDone) {
-                shutdown();
-            }
-
-            return new SSLEngineResult(getEngineStatus(), handshakeStatus0(), 0, bytesProduced);
-        }
 
         // There was no pending data in the network BIO -- encrypt any application data
         int bytesConsumed = 0;
@@ -484,42 +498,44 @@ public final class OpenSslEngine extends SSLEngine {
             while (src.hasRemaining()) {
 
                 // Write plaintext application data to the SSL engine
-                try {
-                    bytesConsumed += writePlaintextData(src);
-                } catch (Exception e) {
-                    throw new SSLException(e);
+                int result = writePlaintextData(src);
+                if (result > 0) {
+                    bytesConsumed += result;
+                } else {
+                    int sslError = SSL.getError(ssl, result);
+                    switch (sslError) {
+                    case SSL.SSL_ERROR_ZERO_RETURN:
+                        // This means the connection was shutdown correctly, close inbound and outbound
+                        if (!receivedShutdown) {
+                            closeAll();
+                        }
+                        // fall-trough!
+                    case SSL.SSL_ERROR_WANT_READ:
+                    case SSL.SSL_ERROR_WANT_WRITE:
+                        // Break here as this means we need check if there is something pending in the BIO
+                        break;
+                    default:
+                        // Everything else is considered as error
+                        shutdownWithError("SSL_write");
+                    }
                 }
 
-                // Check to see if the engine wrote data into the network BIO
-                pendingNet = SSL.pendingWrittenBytesInBIO(networkBIO);
-                if (pendingNet > 0) {
-                    // Do we have enough room in dst to write encrypted data?
-                    int capacity = dst.remaining();
-                    if (capacity < pendingNet) {
-                        return new SSLEngineResult(
-                                BUFFER_OVERFLOW, handshakeStatus0(), bytesConsumed, bytesProduced);
-                    }
-
-                    // Write the pending data from the network BIO into the dst buffer
-                    try {
-                        bytesProduced += readEncryptedData(dst, pendingNet);
-                    } catch (Exception e) {
-                        throw new SSLException(e);
-                    }
-
-                    return new SSLEngineResult(getEngineStatus(), handshakeStatus0(), bytesConsumed, bytesProduced);
+                SSLEngineResult pendingNetResult = readPendingBytesFromBIO(dst, bytesConsumed, bytesProduced, status);
+                if (pendingNetResult != null) {
+                    return pendingNetResult;
                 }
             }
         }
-
-        return new SSLEngineResult(getEngineStatus(), handshakeStatus0(), bytesConsumed, bytesProduced);
-    }
-
-    private SSLException newSSLException(String msg) {
-        if (!handshakeFinished) {
-            return new SSLHandshakeException(msg);
+        // We need to check if pendingWrittenBytesInBIO was checked yet, as we may not checked if the srcs was empty,
+        // or only contained empty buffers.
+        if (bytesConsumed == 0) {
+            SSLEngineResult pendingNetResult = readPendingBytesFromBIO(dst, 0, bytesProduced, status);
+            if (pendingNetResult != null) {
+                return pendingNetResult;
+            }
         }
-        return new SSLException(msg);
+
+        return newResult(bytesConsumed, bytesProduced, status);
     }
 
     private void checkPendingHandshakeException() throws SSLHandshakeException {
@@ -531,12 +547,33 @@ public final class OpenSslEngine extends SSLEngine {
         }
     }
 
+    /**
+     * Log the error, shutdown the engine and throw an exception.
+     */
+    private void shutdownWithError(String operations) throws SSLException {
+        String err = SSL.getLastError();
+        shutdownWithError(operations, err);
+    }
+
+    private void shutdownWithError(String operation, String err) throws SSLException {
+        if (logger.isDebugEnabled()) {
+            logger.debug("{} failed: OpenSSL error: {}", operation, err);
+        }
+
+        // There was an internal error -- shutdown
+        shutdown();
+        if (handshakeState == HandshakeState.FINISHED) {
+            throw new SSLException(err);
+        }
+        throw new SSLHandshakeException(err);
+    }
+
     public synchronized SSLEngineResult unwrap(
             final ByteBuffer[] srcs, int srcsOffset, final int srcsLength,
             final ByteBuffer[] dsts, final int dstsOffset, final int dstsLength) throws SSLException {
 
         // Check to make sure the engine has not been closed
-        if (destroyed != 0) {
+        if (isDestroyed()) {
             return CLOSED_NOT_HANDSHAKING;
         }
 
@@ -558,7 +595,7 @@ public final class OpenSslEngine extends SSLEngine {
                     "offset: " + dstsOffset + ", length: " + dstsLength +
                     " (expected: offset <= offset + length <= dsts.length (" + dsts.length + "))");
         }
-        int capacity = 0;
+        long capacity = 0;
         final int endOffset = dstsOffset + dstsLength;
         for (int i = dstsOffset; i < endOffset; i ++) {
             ByteBuffer dst = dsts[i];
@@ -571,16 +608,16 @@ public final class OpenSslEngine extends SSLEngine {
             capacity += dst.remaining();
         }
 
+        HandshakeStatus status = NOT_HANDSHAKING;
         // Prepare OpenSSL to work in server mode and receive handshake
-        if (accepted == 0) {
-            beginHandshakeImplicitly();
-        }
+        if (handshakeState != HandshakeState.FINISHED) {
+            if (handshakeState != HandshakeState.STARTED_EXPLICITLY) {
+                // Update accepted so we know we triggered the handshake via wrap
+                handshakeState = HandshakeState.STARTED_IMPLICITLY;
+            }
 
-        // In handshake or close_notify stages, check if call to unwrap was made
-        // without regard to the handshake status.
-        SSLEngineResult.HandshakeStatus handshakeStatus = handshakeStatus0();
-        if (handshakeStatus == NEED_WRAP) {
-            if (!handshakeFinished) {
+            status = handshake();
+            if (status == NEED_WRAP) {
                 return NEED_WRAP_OK;
             }
             if (engineClosed) {
@@ -589,7 +626,7 @@ public final class OpenSslEngine extends SSLEngine {
         }
 
         final int srcsEndOffset = srcsOffset + srcsLength;
-        int len = 0;
+        long len = 0;
         for (int i = srcsOffset; i < srcsEndOffset; i++) {
             ByteBuffer src = srcs[i];
             if (src == null) {
@@ -608,72 +645,46 @@ public final class OpenSslEngine extends SSLEngine {
         }
 
         // Write encrypted data to network BIO
-        int bytesConsumed = -1;
-        try {
-            while (srcsOffset < srcsEndOffset) {
+        int bytesConsumed = 0;
+        if (srcsOffset < srcsEndOffset) {
+            do {
                 ByteBuffer src = srcs[srcsOffset];
                 int remaining = src.remaining();
+                if (remaining == 0) {
+                    // We must skip empty buffers as BIO_write will return 0 if asked to write something
+                    // with length 0.
+                    srcsOffset ++;
+                    continue;
+                }
                 int written = writeEncryptedData(src);
-                if (written >= 0) {
-                    if (bytesConsumed == -1) {
-                        bytesConsumed = written;
-                    } else {
-                        bytesConsumed += written;
-                    }
+                if (written > 0) {
+                    bytesConsumed += written;
+
                     if (written == remaining) {
                         srcsOffset ++;
-                    } else if (written == 0) {
+                    } else {
+                        // We were not able to write everything into the BIO so break the write loop as otherwise
+                        // we will produce an error on the next write attempt, which will trigger a SSL.clearError()
+                        // later.
                         break;
                     }
                 } else {
+                    // BIO_write returned a negative or zero number, this means we could not complete the write
+                    // operation and should retry later.
+                    // We ignore BIO_* errors here as we use in memory BIO anyway and will do another SSL_* call later
+                    // on in which we will produce an exception in case of an error
+                    SSL.clearError();
                     break;
                 }
-            }
-        } catch (Exception e) {
-            throw new SSLException(e);
-        }
-        if (bytesConsumed >= 0) {
-            int lastPrimingReadResult = SSL.readFromSSL(ssl, EMPTY_ADDR, 0); // priming read
-
-            // check if SSL_read returned <= 0. In this case we need to check the error and see if it was something
-            // fatal.
-            if (lastPrimingReadResult <= 0) {
-                // Check for OpenSSL errors caused by the priming read
-                long error = SSL.getLastErrorNumber();
-                if (OpenSsl.isError(error)) {
-                    String err = SSL.getErrorString(error);
-                    if (logger.isDebugEnabled()) {
-                        logger.debug(
-                                "SSL_read failed: primingReadResult: " + lastPrimingReadResult +
-                                        "; OpenSSL error: '" + err + '\'');
-                    }
-
-                    // There was an internal error -- shutdown
-                    shutdown();
-                    throw newSSLException(err);
-                } else {
-                    checkPendingHandshakeException();
-                }
-            }
-
-            rejectRemoteInitiatedRenegation();
-        } else {
-            // Reset to 0 as -1 is used to signal that nothing was written and no priming read needs to be done
-            bytesConsumed = 0;
+            } while (srcsOffset < srcsEndOffset);
         }
 
-        // There won't be any application data until we're done handshaking
-        //
-        // We first check handshakeFinished to eliminate the overhead of extra JNI call if possible.
-        int pendingApp = (handshakeFinished || SSL.isInInit(ssl) == 0) ? SSL.pendingReadableBytesInSSL(ssl) : 0;
+        rejectRemoteInitiatedRenegation();
+
+        // Number of produced bytes
         int bytesProduced = 0;
 
-        if (pendingApp > 0) {
-            // Do we have enough room in dsts to write decrypted data?
-            if (capacity < pendingApp) {
-                return new SSLEngineResult(BUFFER_OVERFLOW, handshakeStatus0(), bytesConsumed, 0);
-            }
-
+        if (capacity > 0) {
             // Write decrypted data to dsts buffers
             int idx = dstsOffset;
             while (idx < endOffset) {
@@ -683,39 +694,83 @@ public final class OpenSslEngine extends SSLEngine {
                     continue;
                 }
 
-                if (pendingApp <= 0) {
-                    break;
-                }
+                int bytesRead = readPlaintextData(dst);
 
-                int bytesRead;
-                try {
-                    bytesRead = readPlaintextData(dst);
-                } catch (Exception e) {
-                    throw new SSLException(e);
-                }
-
+                // TODO: We may want to consider if we move this check and only do it in a less often called place at
+                // the price of not being 100% accurate, like for example when calling SSL.getError(...).
                 rejectRemoteInitiatedRenegation();
 
-                if (bytesRead == 0) {
-                    break;
-                }
-                bytesProduced += bytesRead;
-                pendingApp -= bytesRead;
+                if (bytesRead > 0) {
+                    bytesProduced += bytesRead;
 
-                if (!dst.hasRemaining()) {
-                    idx ++;
+                    if (!dst.hasRemaining()) {
+                        idx ++;
+                    } else {
+                        // We read everything return now.
+                        return newResult(bytesConsumed, bytesProduced, status);
+                    }
+                } else {
+                    int sslError = SSL.getError(ssl, bytesRead);
+                    switch (sslError) {
+                    case SSL.SSL_ERROR_ZERO_RETURN:
+                        // This means the connection was shutdown correctly, close inbound and outbound
+                        if (!receivedShutdown) {
+                            closeAll();
+                        }
+                        // fall-trough!
+                    case SSL.SSL_ERROR_WANT_READ:
+                    case SSL.SSL_ERROR_WANT_WRITE:
+                        // break to the outer loop
+                        return newResult(bytesConsumed, bytesProduced, status);
+                    default:
+                        // Everything else is considered as error so shutdown and throw an exceptions
+                        shutdownWithError("SSL_read");
+                    }
+                }
+            }
+        } else {
+            // If the capacity of all destination buffers is 0 we need to trigger a SSL_read anyway to ensure
+            // everything is flushed in the BIO pair and so we can detect it in the pendingAppData() call.
+            if (SSL.readFromSSL(ssl, EMPTY_ADDR, 0) <= 0) {
+                // We do not check SSL_get_error as we are not interested in any error that is not fatal.
+                int err = SSL.getLastErrorNumber();
+                if (OpenSsl.isError(err)) {
+                    shutdownWithError("SSL_read", SSL.getErrorString(err));
                 }
             }
         }
-
-        // Check to see if we received a close_notify message from the peer
-        if (!receivedShutdown && (SSL.getShutdown(ssl) & SSL.SSL_RECEIVED_SHUTDOWN) == SSL.SSL_RECEIVED_SHUTDOWN) {
-            receivedShutdown = true;
-            closeOutbound();
-            closeInbound();
+        if (pendingAppData() > 0) {
+            // We filled all buffers but there is still some data pending in the BIO buffer, return BUFFER_OVERFLOW.
+            return new SSLEngineResult(
+                    BUFFER_OVERFLOW, mayFinishHandshake(status != FINISHED ? getHandshakeStatus(): status),
+                    bytesConsumed, bytesProduced);
         }
 
-        return new SSLEngineResult(getEngineStatus(), handshakeStatus0(), bytesConsumed, bytesProduced);
+        // Check to see if we received a close_notify message from the peer.
+        if (!receivedShutdown && (SSL.getShutdown(ssl) & SSL.SSL_RECEIVED_SHUTDOWN) == SSL.SSL_RECEIVED_SHUTDOWN) {
+            closeAll();
+        }
+
+        return newResult(bytesConsumed, bytesProduced, status);
+    }
+
+    private int pendingAppData() {
+        // There won't be any application data until we're done handshaking.
+        // We first check handshakeFinished to eliminate the overhead of extra JNI call if possible.
+        return handshakeState == HandshakeState.FINISHED ? SSL.pendingReadableBytesInSSL(ssl) : 0;
+    }
+
+    private SSLEngineResult newResult(
+            int bytesConsumed, int bytesProduced, HandshakeStatus status) throws SSLException {
+       return new SSLEngineResult(
+               getEngineStatus(), mayFinishHandshake(status != FINISHED ? getHandshakeStatus() : status)
+               , bytesConsumed, bytesProduced);
+    }
+
+    private void closeAll() throws SSLException {
+        receivedShutdown = true;
+        closeOutbound();
+        closeInbound();
     }
 
     private void rejectRemoteInitiatedRenegation() throws SSLHandshakeException {
@@ -756,7 +811,7 @@ public final class OpenSslEngine extends SSLEngine {
 
         shutdown();
 
-        if (accepted != 0 && !receivedShutdown) {
+        if (handshakeState != HandshakeState.NOT_STARTED && !receivedShutdown) {
             throw new SSLException(
                     "Inbound closed before receiving peer's close_notify: possible truncation attack?");
         }
@@ -776,10 +831,35 @@ public final class OpenSslEngine extends SSLEngine {
         isOutboundDone = true;
         engineClosed = true;
 
-        if (accepted != 0 && destroyed == 0) {
+        if (handshakeState != HandshakeState.NOT_STARTED && !isDestroyed()) {
             int mode = SSL.getShutdown(ssl);
             if ((mode & SSL.SSL_SENT_SHUTDOWN) != SSL.SSL_SENT_SHUTDOWN) {
-                SSL.shutdownSSL(ssl);
+                int err = SSL.shutdownSSL(ssl);
+                if (err < 0) {
+                    int sslErr = SSL.getError(ssl, err);
+                    switch (sslErr) {
+                    case SSL.SSL_ERROR_NONE:
+                    case SSL.SSL_ERROR_WANT_ACCEPT:
+                    case SSL.SSL_ERROR_WANT_CONNECT:
+                    case SSL.SSL_ERROR_WANT_WRITE:
+                    case SSL.SSL_ERROR_WANT_READ:
+                    case SSL.SSL_ERROR_WANT_X509_LOOKUP:
+                    case SSL.SSL_ERROR_ZERO_RETURN:
+                        // Nothing to do here
+                        break;
+                    case SSL.SSL_ERROR_SYSCALL:
+                    case SSL.SSL_ERROR_SSL:
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("SSL_shutdown failed: OpenSSL error: {}", SSL.getLastError());
+                        }
+                        // There was an internal error -- shutdown
+                        shutdown();
+                        break;
+                    default:
+                        SSL.clearError();
+                        break;
+                    }
+                }
             }
         } else {
             // engine closing before initial handshake
@@ -802,7 +882,7 @@ public final class OpenSslEngine extends SSLEngine {
     public String[] getEnabledCipherSuites() {
         final String[] enabled;
         synchronized (this) {
-            if (destroyed == 0) {
+            if (!isDestroyed()) {
                 enabled = SSL.getCiphers(ssl);
             } else {
                 return EmptyArrays.EMPTY_STRINGS;
@@ -852,7 +932,7 @@ public final class OpenSslEngine extends SSLEngine {
         final String cipherSuiteSpec = buf.toString();
 
         synchronized (this) {
-            if (destroyed == 0) {
+            if (!isDestroyed()) {
                 try {
                     SSL.setCipherSuites(ssl, cipherSuiteSpec);
                 } catch (Exception e) {
@@ -877,7 +957,7 @@ public final class OpenSslEngine extends SSLEngine {
 
         int opts;
         synchronized (this) {
-            if (destroyed == 0) {
+            if (!isDestroyed()) {
                 opts = SSL.getOptions(ssl);
             } else {
                 return enabled.toArray(new String[1]);
@@ -929,7 +1009,7 @@ public final class OpenSslEngine extends SSLEngine {
             }
         }
         synchronized (this) {
-            if (destroyed == 0) {
+            if (!isDestroyed()) {
                 // Enable all and then disable what we not want
                 SSL.setOptions(ssl, SSL.SSL_OP_ALL);
 
@@ -961,63 +1041,91 @@ public final class OpenSslEngine extends SSLEngine {
 
     @Override
     public synchronized void beginHandshake() throws SSLException {
-        if (engineClosed || destroyed != 0) {
-            throw ENGINE_CLOSED;
-        }
-        switch (accepted) {
-            case 0:
-                handshake();
-                accepted = 2;
-                break;
-            case 1:
+        switch (handshakeState) {
+            case STARTED_IMPLICITLY:
+                checkEngineClosed();
+
                 // A user did not start handshake by calling this method by him/herself,
                 // but handshake has been started already by wrap() or unwrap() implicitly.
                 // Because it's the user's first time to call this method, it is unfair to
                 // raise an exception.  From the user's standpoint, he or she never asked
                 // for renegotiation.
 
-                accepted = 2; // Next time this method is invoked by the user, we should raise an exception.
+                handshakeState = HandshakeState.STARTED_EXPLICITLY; // Next time this method is invoked by the user,
+                                                                    // we should raise an exception.
                 break;
-            case 2:
-                throw RENEGOTIATION_UNSUPPORTED;
+            case STARTED_EXPLICITLY:
+                // Nothing to do as the handshake is not done yet.
+                break;
+            case FINISHED:
+                if (clientMode) {
+                    // Only supported for server mode at the moment.
+                    throw RENEGOTIATION_UNSUPPORTED;
+                }
+                // For renegotiate on the server side we need to issue the following command sequence with openssl:
+                //
+                // SSL_renegotiate(ssl)
+                // SSL_do_handshake(ssl)
+                // ssl->state = SSL_ST_ACCEPT
+                // SSL_do_handshake(ssl)
+                //
+                // Bcause of this we fall-through to call handshake() after setting the state, as this will also take
+                // care of updating the internal OpenSslSession object.
+                //
+                // See also:
+                // https://github.com/apache/httpd/blob/2.4.16/modules/ssl/ssl_engine_kernel.c#L812
+                // http://h71000.www7.hp.com/doc/83final/ba554_90007/ch04s03.html
+                if (SSL.renegotiate(ssl) != 1 || SSL.doHandshake(ssl) != 1) {
+                    shutdownWithError("renegotiation failed");
+                }
+
+                SSL.setState(ssl, SSL.SSL_ST_ACCEPT);
+                // fall-through
+            case NOT_STARTED:
+                handshakeState = HandshakeState.STARTED_EXPLICITLY;
+                handshake();
+                break;
             default:
                 throw new Error();
         }
     }
 
-    private void beginHandshakeImplicitly() throws SSLException {
-        if (engineClosed || destroyed != 0) {
+    private void checkEngineClosed() throws SSLException {
+        if (engineClosed || isDestroyed()) {
             throw ENGINE_CLOSED;
-        }
-
-        if (accepted == 0) {
-            handshake();
-            accepted = 1;
         }
     }
 
-    private void handshake() throws SSLException {
+    private static HandshakeStatus pendingStatus(int pendingStatus) {
+        // Depending on if there is something left in the BIO we need to WRAP or UNWRAP
+        return pendingStatus > 0 ? NEED_WRAP : NEED_UNWRAP;
+    }
+
+    private HandshakeStatus handshake() throws SSLException {
+        if (handshakeState == HandshakeState.FINISHED) {
+            return FINISHED;
+        }
+        checkEngineClosed();
         int code = SSL.doHandshake(ssl);
         if (code <= 0) {
-            // Check for OpenSSL errors caused by the handshake
-            long error = SSL.getLastErrorNumber();
-            if (OpenSsl.isError(error)) {
-                String err = SSL.getErrorString(error);
-                if (logger.isDebugEnabled()) {
-                    logger.debug(
-                            "SSL_do_handshake failed: OpenSSL error: '" + err + '\'');
-                }
-
-                // There was an internal error -- shutdown
-                shutdown();
-                throw newSSLException(err);
-            }
             checkPendingHandshakeException();
-        } else {
-            // if SSL_do_handshake returns > 0 it means the handshake was finished. This means we can update
-            // handshakeFinished directly and so eliminate uncessary calls to SSL.isInInit(...)
-            handshakeFinished();
+
+            int sslError = SSL.getError(ssl, code);
+
+            switch (sslError) {
+            case SSL.SSL_ERROR_WANT_READ:
+            case SSL.SSL_ERROR_WANT_WRITE:
+                return pendingStatus(SSL.pendingWrittenBytesInBIO(networkBIO));
+            default:
+                // Everything else is considered as error
+                shutdownWithError("SSL_do_handshake");
+            }
         }
+
+        // if SSL_do_handshake returns > 0 or sslError == SSL.SSL_ERROR_NAME it means the handshake was finished.
+        session.handshakeFinished();
+
+        return FINISHED;
     }
 
     private static long memoryAddress(ByteBuf buf) {
@@ -1028,112 +1136,40 @@ public final class OpenSslEngine extends SSLEngine {
         }
     }
 
-    private void handshakeFinished() throws SSLException {
-        SelectedListenerFailureBehavior behavior = apn.selectedListenerFailureBehavior();
-        List<String> protocols = apn.protocols();
-        String applicationProtocol;
-        switch (apn.protocol()) {
-            case NONE:
-                break;
-            // We always need to check for applicationProtocol == null as the remote peer may not support
-            // the TLS extension or may have returned an empty selection.
-            case ALPN:
-                applicationProtocol = SSL.getAlpnSelected(ssl);
-                if (applicationProtocol != null) {
-                    this.applicationProtocol = selectApplicationProtocol(protocols, behavior, applicationProtocol);
-                }
-                break;
-            case NPN:
-                applicationProtocol = SSL.getNextProtoNegotiated(ssl);
-                if (applicationProtocol != null) {
-                    this.applicationProtocol = selectApplicationProtocol(protocols, behavior, applicationProtocol);
-                }
-                break;
-            case NPN_AND_ALPN:
-                applicationProtocol = SSL.getAlpnSelected(ssl);
-                if (applicationProtocol == null) {
-                    applicationProtocol = SSL.getNextProtoNegotiated(ssl);
-                }
-                if (applicationProtocol != null) {
-                    this.applicationProtocol = selectApplicationProtocol(protocols, behavior, applicationProtocol);
-                }
-                break;
-            default:
-                throw new Error();
-        }
-        handshakeFinished = true;
-    }
-
-    private static String selectApplicationProtocol(List<String> protocols,
-                                             SelectedListenerFailureBehavior behavior,
-                                             String applicationProtocol) throws SSLException {
-        if (behavior == SelectedListenerFailureBehavior.ACCEPT) {
-            return applicationProtocol;
-        } else {
-            int size = protocols.size();
-            assert size > 0;
-            if (protocols.contains(applicationProtocol)) {
-                return applicationProtocol;
-            } else {
-                if (behavior == SelectedListenerFailureBehavior.CHOOSE_MY_LAST_PROTOCOL) {
-                    return protocols.get(size - 1);
-                } else {
-                    throw new SSLException("unknown protocol " + applicationProtocol);
-                }
-            }
-        }
-    }
-
     private SSLEngineResult.Status getEngineStatus() {
         return engineClosed? CLOSED : OK;
     }
 
-    private SSLEngineResult.HandshakeStatus handshakeStatus0() throws SSLException {
-        SSLEngineResult.HandshakeStatus status = getHandshakeStatus();
-        if (status == FINISHED) {
-            handshakeFinished();
+    private SSLEngineResult.HandshakeStatus mayFinishHandshake(SSLEngineResult.HandshakeStatus status)
+            throws SSLException {
+        if (status == NOT_HANDSHAKING && handshakeState != HandshakeState.FINISHED) {
+            // If the status was NOT_HANDSHAKING and we not finished the handshake we need to call
+            // SSL_do_handshake() again
+            return handshake();
         }
-        checkPendingHandshakeException();
-
         return status;
     }
 
     @Override
     public synchronized SSLEngineResult.HandshakeStatus getHandshakeStatus() {
-        if (accepted == 0 || destroyed != 0) {
-            return NOT_HANDSHAKING;
+        // Check if we are in the initial handshake phase or shutdown phase
+        if (needPendingStatus()) {
+            return pendingStatus(SSL.pendingWrittenBytesInBIO(networkBIO));
         }
-
-        // Check if we are in the initial handshake phase
-        if (!handshakeFinished) {
-            // There is pending data in the network BIO -- call wrap
-            if (SSL.pendingWrittenBytesInBIO(networkBIO) != 0) {
-                return NEED_WRAP;
-            }
-
-            // No pending data to be sent to the peer
-            // Check to see if we have finished handshaking
-            if (SSL.isInInit(ssl) == 0) {
-                return FINISHED;
-            }
-
-            // No pending data and still handshaking
-            // Must be waiting on the peer to send more data
-            return NEED_UNWRAP;
-        }
-
-        // Check if we are in the shutdown phase
-        if (engineClosed) {
-            // Waiting to send the close_notify message
-            if (SSL.pendingWrittenBytesInBIO(networkBIO) != 0) {
-                return NEED_WRAP;
-            }
-
-            // Must be waiting to receive the close_notify message
-            return NEED_UNWRAP;
-        }
-
         return NOT_HANDSHAKING;
+    }
+
+    private SSLEngineResult.HandshakeStatus getHandshakeStatus(int pending) {
+        // Check if we are in the initial handshake phase or shutdown phase
+        if (needPendingStatus()) {
+            return pendingStatus(pending);
+        }
+        return NOT_HANDSHAKING;
+    }
+
+    private boolean needPendingStatus() {
+        return handshakeState != HandshakeState.NOT_STARTED && !isDestroyed()
+               && (handshakeState != HandshakeState.FINISHED || engineClosed);
     }
 
     /**
@@ -1183,25 +1219,25 @@ public final class OpenSslEngine extends SSLEngine {
 
     @Override
     public void setNeedClientAuth(boolean b) {
-        setClientAuth(b ? ClientAuthMode.REQUIRE : ClientAuthMode.NONE);
+        setClientAuth(b ? ClientAuth.REQUIRE : ClientAuth.NONE);
     }
 
     @Override
     public boolean getNeedClientAuth() {
-        return clientAuth == ClientAuthMode.REQUIRE;
+        return clientAuth == ClientAuth.REQUIRE;
     }
 
     @Override
     public void setWantClientAuth(boolean b) {
-        setClientAuth(b ? ClientAuthMode.OPTIONAL : ClientAuthMode.NONE);
+        setClientAuth(b ? ClientAuth.OPTIONAL : ClientAuth.NONE);
     }
 
     @Override
     public boolean getWantClientAuth() {
-        return clientAuth == ClientAuthMode.OPTIONAL;
+        return clientAuth == ClientAuth.OPTIONAL;
     }
 
-    private void setClientAuth(ClientAuthMode mode) {
+    private void setClientAuth(ClientAuth mode) {
         if (clientMode) {
             return;
         }
@@ -1266,29 +1302,39 @@ public final class OpenSslEngine extends SSLEngine {
         shutdown();
     }
 
+    private boolean isDestroyed() {
+        return destroyed != 0;
+    }
+
     private final class OpenSslSession implements SSLSession, ApplicationProtocolAccessor {
-        // SSLSession implementation seems to not need to be thread-safe so no need for volatile etc.
+        private final OpenSslSessionContext sessionContext;
+        private final long creationTime;
+
+        // These are guarded by synchronized(OpenSslEngine.this) as handshakeFinished() may be triggered by any
+        // thread.
         private X509Certificate[] x509PeerCerts;
+        private String protocol;
+        private String applicationProtocol;
+        private Certificate[] peerCerts;
+        private String cipher;
+        private byte[] id;
 
         // lazy init for memory reasons
         private Map<String, Object> values;
 
+        OpenSslSession(long ssl, OpenSslSessionContext sessionContext) {
+            creationTime = SSL.getTime(ssl) * 1000L;
+            this.sessionContext = sessionContext;
+        }
+
         @Override
         public byte[] getId() {
-            final byte[] id;
             synchronized (OpenSslEngine.this) {
-                if (destroyed == 0) {
-                    id = SSL.getSessionId(ssl);
-                } else {
-                    id = EmptyArrays.EMPTY_BYTES;
+                if (id == null) {
+                    return EmptyArrays.EMPTY_BYTES;
                 }
+                return id.clone();
             }
-            // We don't cache that to keep memory usage to a minimum.
-            if (id == null) {
-                // The id should never be null, if it was null then the SESSION itself was not valid.
-                throw new IllegalStateException("SSL session ID not available");
-            }
-            return id;
         }
 
         @Override
@@ -1298,13 +1344,7 @@ public final class OpenSslEngine extends SSLEngine {
 
         @Override
         public long getCreationTime() {
-            synchronized (OpenSslEngine.this) {
-                if (destroyed == 0) {
-                    // We need ot multiple by 1000 as openssl uses seconds and we need milli-seconds.
-                    return SSL.getTime(ssl) * 1000L;
-                }
-                return 0;
-            }
+            return creationTime;
         }
 
         @Override
@@ -1382,121 +1422,213 @@ public final class OpenSslEngine extends SSLEngine {
             }
         }
 
-        @Override
-        public Certificate[] getPeerCertificates() throws SSLPeerUnverifiedException {
-            // these are lazy created to reduce memory overhead
-            Certificate[] c = peerCerts;
-            if (c == null) {
-                synchronized (OpenSslEngine.this) {
-                    if (destroyed == 0) {
-                        if (SSL.isInInit(ssl) != 0) {
-                            throw new SSLPeerUnverifiedException("peer not verified");
-                        }
-                        c = peerCerts = initPeerCertChain();
+        /**
+         * Finish the handshake and so init everything in the {@link OpenSslSession} that should be accessable by
+         * the user.
+         */
+        void handshakeFinished() throws SSLException {
+            synchronized (OpenSslEngine.this) {
+                if (!isDestroyed()) {
+                    id = SSL.getSessionId(ssl);
+                    cipher = toJavaCipherSuite(SSL.getCipherForSSL(ssl));
+                    protocol = SSL.getVersion(ssl);
+
+                    initPeerCerts();
+                    selectApplicationProtocol();
+
+                    handshakeState = HandshakeState.FINISHED;
+                } else {
+                    throw new SSLException("Already closed");
+                }
+            }
+        }
+
+        /**
+         * Init peer certificates that can be obtained via {@link #getPeerCertificateChain()}
+         * and {@link #getPeerCertificates()}.
+         */
+        private void initPeerCerts() {
+            // Return the full chain from the JNI layer.
+            byte[][] chain = SSL.getPeerCertChain(ssl);
+            final byte[] clientCert;
+            if (!clientMode) {
+                // if used on the server side SSL_get_peer_cert_chain(...) will not include the remote peer
+                // certificate. We use SSL_get_peer_certificate to get it in this case and add it to our
+                // array later.
+                //
+                // See https://www.openssl.org/docs/ssl/SSL_get_peer_cert_chain.html
+                clientCert = SSL.getPeerCertificate(ssl);
+            } else {
+                clientCert = null;
+            }
+
+            if (chain == null && clientCert == null) {
+                peerCerts = EMPTY_CERTIFICATES;
+                x509PeerCerts = EMPTY_X509_CERTIFICATES;
+            } else {
+                int len = chain != null ? chain.length : 0;
+
+                int i = 0;
+                Certificate[] peerCerts;
+                if (clientCert != null) {
+                    len++;
+                    peerCerts = new Certificate[len];
+                    peerCerts[i++] = new OpenSslX509Certificate(clientCert);
+                } else {
+                    peerCerts = new Certificate[len];
+                }
+                if (chain != null) {
+                    X509Certificate[] pCerts = new X509Certificate[chain.length];
+
+                    for (int a = 0; a < pCerts.length; ++i, ++a) {
+                        byte[] bytes = chain[a];
+                        pCerts[a] = new OpenSslJavaxX509Certificate(bytes);
+                        peerCerts[i] = new OpenSslX509Certificate(bytes);
+                    }
+                    x509PeerCerts = pCerts;
+                } else {
+                    x509PeerCerts = EMPTY_X509_CERTIFICATES;
+                }
+                this.peerCerts = peerCerts;
+            }
+        }
+
+        /**
+         * Select the application protocol used.
+         */
+        private void selectApplicationProtocol() throws SSLException {
+            SelectedListenerFailureBehavior behavior = apn.selectedListenerFailureBehavior();
+            List<String> protocols = apn.protocols();
+            String applicationProtocol;
+            switch (apn.protocol()) {
+            case NONE:
+                break;
+            // We always need to check for applicationProtocol == null as the remote peer may not support
+            // the TLS extension or may have returned an empty selection.
+            case ALPN:
+                applicationProtocol = SSL.getAlpnSelected(ssl);
+                if (applicationProtocol != null) {
+                    this.applicationProtocol = selectApplicationProtocol(
+                            protocols, behavior, applicationProtocol);
+                }
+                break;
+            case NPN:
+                applicationProtocol = SSL.getNextProtoNegotiated(ssl);
+                if (applicationProtocol != null) {
+                    this.applicationProtocol = selectApplicationProtocol(
+                            protocols, behavior, applicationProtocol);
+                }
+                break;
+            case NPN_AND_ALPN:
+                applicationProtocol = SSL.getAlpnSelected(ssl);
+                if (applicationProtocol == null) {
+                    applicationProtocol = SSL.getNextProtoNegotiated(ssl);
+                }
+                if (applicationProtocol != null) {
+                    this.applicationProtocol = selectApplicationProtocol(
+                            protocols, behavior, applicationProtocol);
+                }
+                break;
+            default:
+                throw new Error();
+            }
+        }
+
+        private String selectApplicationProtocol(List<String> protocols,
+                                                        SelectedListenerFailureBehavior behavior,
+                                                        String applicationProtocol) throws SSLException {
+            if (behavior == SelectedListenerFailureBehavior.ACCEPT) {
+                return applicationProtocol;
+            } else {
+                int size = protocols.size();
+                assert size > 0;
+                if (protocols.contains(applicationProtocol)) {
+                    return applicationProtocol;
+                } else {
+                    if (behavior == SelectedListenerFailureBehavior.CHOOSE_MY_LAST_PROTOCOL) {
+                        return protocols.get(size - 1);
                     } else {
-                        c = peerCerts = EMPTY_CERTIFICATES;
+                        throw new SSLException("unknown protocol " + applicationProtocol);
                     }
                 }
             }
-            return c;
+        }
+
+        @Override
+        public Certificate[] getPeerCertificates() throws SSLPeerUnverifiedException {
+            synchronized (OpenSslEngine.this) {
+                if (peerCerts == null || peerCerts.length == 0) {
+                    throw new SSLPeerUnverifiedException("peer not verified");
+                }
+                return peerCerts;
+            }
         }
 
         @Override
         public Certificate[] getLocalCertificates() {
-            // TODO: Find out how to get these
-            return EMPTY_CERTIFICATES;
+            if (localCerts == null) {
+                return null;
+            }
+            return localCerts.clone();
         }
 
         @Override
         public X509Certificate[] getPeerCertificateChain() throws SSLPeerUnverifiedException {
-            // these are lazy created to reduce memory overhead
-            X509Certificate[] c = x509PeerCerts;
-            if (c == null) {
-                final byte[][] chain;
-                synchronized (OpenSslEngine.this) {
-                    if (destroyed == 0) {
-                        if (SSL.isInInit(ssl) != 0) {
-                            throw new SSLPeerUnverifiedException("peer not verified");
-                        }
-                        chain = SSL.getPeerCertChain(ssl);
-                    } else {
-                        c = x509PeerCerts = EMPTY_X509_CERTIFICATES;
-                        return c;
-                    }
-                }
-                if (chain == null) {
+            synchronized (OpenSslEngine.this) {
+                if (x509PeerCerts == null || x509PeerCerts.length == 0) {
                     throw new SSLPeerUnverifiedException("peer not verified");
                 }
-                X509Certificate[] peerCerts = new X509Certificate[chain.length];
-                for (int i = 0; i < peerCerts.length; i++) {
-                    try {
-                        peerCerts[i] = X509Certificate.getInstance(chain[i]);
-                    } catch (CertificateException e) {
-                        throw new IllegalStateException(e);
-                    }
-                }
-                c = x509PeerCerts = peerCerts;
+                return x509PeerCerts;
             }
-            return c;
         }
 
         @Override
         public Principal getPeerPrincipal() throws SSLPeerUnverifiedException {
             Certificate[] peer = getPeerCertificates();
-            if (peer == null || peer.length == 0) {
-                return null;
-            }
-            return principal(peer);
+            // No need for null or length > 0 is needed as this is done in getPeerCertificates()
+            // already.
+            return ((java.security.cert.X509Certificate) peer[0]).getSubjectX500Principal();
         }
 
         @Override
         public Principal getLocalPrincipal() {
-            Certificate[] local = getLocalCertificates();
+            Certificate[] local = localCerts;
             if (local == null || local.length == 0) {
                 return null;
             }
-            return principal(local);
-        }
-
-        private Principal principal(Certificate[] certs) {
-            return ((java.security.cert.X509Certificate) certs[0]).getIssuerX500Principal();
+            return ((java.security.cert.X509Certificate) local[0]).getIssuerX500Principal();
         }
 
         @Override
         public String getCipherSuite() {
-            if (!handshakeFinished) {
-                return INVALID_CIPHER;
-            }
-            if (cipher == null) {
-                final String c;
-                synchronized (OpenSslEngine.this) {
-                    if (destroyed == 0) {
-                        c = toJavaCipherSuite(SSL.getCipherForSSL(ssl));
-                    } else {
-                        c = INVALID_CIPHER;
-                    }
+            synchronized (OpenSslEngine.this) {
+                if (cipher == null) {
+                    return INVALID_CIPHER;
                 }
-                if (c != null) {
-                    cipher = c;
-                }
+                return cipher;
             }
-            return cipher;
         }
 
         @Override
         public String getProtocol() {
-            synchronized (OpenSslEngine.this) {
-                if (destroyed == 0) {
-                    return SSL.getVersion(ssl);
-                } else {
-                    return StringUtil.EMPTY_STRING;
+            String protocol = this.protocol;
+            if (protocol == null) {
+                synchronized (OpenSslEngine.this) {
+                    if (!isDestroyed()) {
+                        protocol = SSL.getVersion(ssl);
+                    } else {
+                        protocol = StringUtil.EMPTY_STRING;
+                    }
                 }
             }
+            return protocol;
         }
 
         @Override
         public String getApplicationProtocol() {
-            return applicationProtocol;
+            synchronized (OpenSslEngine.this) {
+                return applicationProtocol;
+            }
         }
 
         @Override
@@ -1517,45 +1649,6 @@ public final class OpenSslEngine extends SSLEngine {
         @Override
         public int getApplicationBufferSize() {
             return MAX_PLAINTEXT_LENGTH;
-        }
-
-        private Certificate[] initPeerCertChain() throws SSLPeerUnverifiedException {
-            byte[][] chain = SSL.getPeerCertChain(ssl);
-            final byte[] clientCert;
-            if (!clientMode) {
-                // if used on the server side SSL_get_peer_cert_chain(...) will not include the remote peer certificate.
-                // We use SSL_get_peer_certificate to get it in this case and add it to our array later.
-                //
-                // See https://www.openssl.org/docs/ssl/SSL_get_peer_cert_chain.html
-                clientCert = SSL.getPeerCertificate(ssl);
-            } else {
-                clientCert = null;
-            }
-
-            if (chain == null && clientCert == null) {
-                throw new SSLPeerUnverifiedException("peer not verified");
-            }
-            int len = 0;
-            if (chain != null) {
-                len += chain.length;
-            }
-
-            int i = 0;
-            Certificate[] peerCerts;
-            if (clientCert != null) {
-                len++;
-                peerCerts = new Certificate[len];
-                peerCerts[i++] = new OpenSslX509Certificate(clientCert);
-            } else {
-                peerCerts = new Certificate[len];
-            }
-            if (chain != null) {
-                int a = 0;
-                for (; i < peerCerts.length; i++) {
-                    peerCerts[i] = new OpenSslX509Certificate(chain[a++]);
-                }
-            }
-            return peerCerts;
         }
     }
 }

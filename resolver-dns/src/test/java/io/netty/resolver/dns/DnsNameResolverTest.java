@@ -23,11 +23,11 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.InternetProtocolFamily;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.dns.DefaultDnsQuestion;
-import io.netty.handler.codec.dns.DnsSection;
 import io.netty.handler.codec.dns.DnsRecord;
 import io.netty.handler.codec.dns.DnsRecordType;
 import io.netty.handler.codec.dns.DnsResponse;
 import io.netty.handler.codec.dns.DnsResponseCode;
+import io.netty.handler.codec.dns.DnsSection;
 import io.netty.util.concurrent.Future;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.ThreadLocalRandom;
@@ -37,10 +37,9 @@ import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Test;
 
-import java.net.Inet4Address;
-import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -52,8 +51,13 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
-import static org.hamcrest.Matchers.*;
-import static org.junit.Assert.*;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.is;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThat;
+import static org.junit.Assert.fail;
 
 public class DnsNameResolverTest {
 
@@ -64,9 +68,74 @@ public class DnsNameResolverTest {
             new InetSocketAddress("8.8.4.4", 53),
             new InetSocketAddress("208.67.222.222", 53), // OpenDNS
             new InetSocketAddress("208.67.220.220", 53),
+            new InetSocketAddress("208.67.222.220", 53),
+            new InetSocketAddress("208.67.220.222", 53),
             new InetSocketAddress("37.235.1.174", 53), // FreeDNS
-            new InetSocketAddress("37.235.1.177", 53)
-    );
+            new InetSocketAddress("37.235.1.177", 53),
+            //
+            // OpenNIC - Fusl's Tier 2 DNS servers
+            //
+            // curl http://meo.ws/dnsrec.php | \
+            //   perl -p0 -e 's#(^(.|\r|\n)*<textarea[^>]*>|</textarea>(.|\r|\n)*)##g' | \
+            //   awk -F ',' '{ print $14 }' | \
+            //   grep -E '^[0-9]+.[0-9]+.[0-9]+.[0-9]+$' | \
+            //   perl -p -e 's/^/new InetSocketAddress("/' | \
+            //   perl -p -e 's/$/", 53),/'
+            //
+            new InetSocketAddress("79.133.43.124", 53),
+            new InetSocketAddress("151.236.10.36", 53),
+            new InetSocketAddress("163.47.20.30", 53),
+            new InetSocketAddress("103.25.56.238", 53),
+            new InetSocketAddress("111.223.227.125", 53),
+            new InetSocketAddress("103.241.0.207", 53),
+            new InetSocketAddress("192.71.249.83", 53),
+            new InetSocketAddress("69.28.67.83", 53),
+            new InetSocketAddress("192.121.170.22", 53),
+            new InetSocketAddress("62.141.38.230", 53),
+            new InetSocketAddress("185.97.7.7", 53),
+            new InetSocketAddress("84.200.83.161", 53),
+            new InetSocketAddress("78.47.34.12", 53),
+            new InetSocketAddress("41.215.240.141", 53),
+            new InetSocketAddress("5.134.117.239", 53),
+            new InetSocketAddress("95.175.99.231", 53),
+            new InetSocketAddress("92.222.80.28", 53),
+            new InetSocketAddress("178.79.174.162", 53),
+            new InetSocketAddress("95.129.41.126", 53),
+            new InetSocketAddress("103.53.199.71", 53),
+            new InetSocketAddress("176.62.0.26", 53),
+            new InetSocketAddress("185.112.156.159", 53),
+            new InetSocketAddress("217.78.6.191", 53),
+            new InetSocketAddress("193.182.144.83", 53),
+            new InetSocketAddress("37.235.55.46", 53),
+            new InetSocketAddress("103.250.184.85", 53),
+            new InetSocketAddress("151.236.24.245", 53),
+            new InetSocketAddress("192.121.47.47", 53),
+            new InetSocketAddress("106.185.41.36", 53),
+            new InetSocketAddress("88.82.109.119", 53),
+            new InetSocketAddress("212.117.180.145", 53),
+            new InetSocketAddress("185.61.149.228", 53),
+            new InetSocketAddress("93.158.205.94", 53),
+            new InetSocketAddress("31.220.43.191", 53),
+            new InetSocketAddress("91.247.228.155", 53),
+            new InetSocketAddress("163.47.21.44", 53),
+            new InetSocketAddress("94.46.12.224", 53),
+            new InetSocketAddress("46.108.39.139", 53),
+            new InetSocketAddress("94.242.57.130", 53),
+            new InetSocketAddress("46.151.215.199", 53),
+            new InetSocketAddress("31.220.5.106", 53),
+            new InetSocketAddress("103.25.202.192", 53),
+            new InetSocketAddress("185.65.206.121", 53),
+            new InetSocketAddress("91.229.79.104", 53),
+            new InetSocketAddress("74.207.241.202", 53),
+            new InetSocketAddress("104.245.33.185", 53),
+            new InetSocketAddress("104.245.39.112", 53),
+            new InetSocketAddress("74.207.232.103", 53),
+            new InetSocketAddress("104.237.144.172", 53),
+            new InetSocketAddress("104.237.136.225", 53),
+            new InetSocketAddress("104.219.55.89", 53),
+            new InetSocketAddress("23.226.230.72", 53),
+            new InetSocketAddress("41.185.78.25", 53)
+            );
 
     // Using the top-100 web sites ranked in Alexa.com (Oct 2014)
     // Please use the following series of shell commands to get this up-to-date:
@@ -247,7 +316,7 @@ public class DnsNameResolverTest {
             group.next(), NioDatagramChannel.class, DnsServerAddresses.shuffled(SERVERS));
 
     static {
-        resolver.setMaxTriesPerQuery(SERVERS.size());
+        resolver.setMaxQueriesPerResolve(SERVERS.size());
     }
 
     @AfterClass
@@ -293,6 +362,10 @@ public class DnsNameResolverTest {
             for (Entry<String, InetAddress> e: resultA.entrySet()) {
                 InetAddress expected = e.getValue();
                 InetAddress actual = resultB.get(e.getKey());
+                if (!actual.equals(expected)) {
+                    // Print the content of the cache when test failure is expected.
+                    System.err.println("Cache for " + e.getKey() + ": " + resolver.resolveAll(e.getKey(), 0).getNow());
+                }
                 assertThat(actual, is(expected));
             }
         } finally {
@@ -342,17 +415,8 @@ public class DnsNameResolverTest {
                 boolean typeMatches = false;
                 for (InternetProtocolFamily f: famililies) {
                     Class<?> resolvedType = resolved.getAddress().getClass();
-                    switch (f) {
-                    case IPv4:
-                        if (Inet4Address.class.isAssignableFrom(resolvedType)) {
-                            typeMatches = true;
-                        }
-                        break;
-                    case IPv6:
-                        if (Inet6Address.class.isAssignableFrom(resolvedType)) {
-                            typeMatches = true;
-                        }
-                        break;
+                    if (f.addressType().isAssignableFrom(resolvedType)) {
+                        typeMatches = true;
                     }
                 }
 
@@ -383,9 +447,18 @@ public class DnsNameResolverTest {
 
         for (Entry<String, Future<AddressedEnvelope<DnsResponse, InetSocketAddress>>> e: futures.entrySet()) {
             String hostname = e.getKey();
-            AddressedEnvelope<DnsResponse, InetSocketAddress> envelope = e.getValue().sync().getNow();
-            DnsResponse response = envelope.content();
+            Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> f = e.getValue().awaitUninterruptibly();
+            if (!f.isSuccess()) {
+                // Try again because the DNS servers might be throttling us down.
+                for (int i = 0; i < SERVERS.size(); i++) {
+                    f = queryMx(hostname).awaitUninterruptibly();
+                    if (f.isSuccess() && !DnsResponseCode.SERVFAIL.equals(f.getNow().content().code())) {
+                        break;
+                    }
+                }
+            }
 
+            DnsResponse response = f.getNow().content();
             assertThat(response.code(), is(DnsResponseCode.NOERROR));
 
             final int answerCount = response.count(DnsSection.ANSWER);
@@ -418,6 +491,64 @@ public class DnsNameResolverTest {
         }
     }
 
+    @Test
+    public void testNegativeTtl() throws Exception {
+        final int oldNegativeTtl = resolver.negativeTtl();
+        resolver.setNegativeTtl(10);
+        try {
+            resolveNonExistentDomain();
+
+            final int size = 10000;
+            final List<UnknownHostException> exceptions = new ArrayList<UnknownHostException>();
+
+            // If negative cache works, this thread should be done really quickly.
+            final Thread negativeLookupThread = new Thread() {
+                @Override
+                public void run() {
+                    for (int i = 0; i < size; i++) {
+                        exceptions.add(resolveNonExistentDomain());
+                        if (isInterrupted()) {
+                            break;
+                        }
+                    }
+                }
+            };
+
+            negativeLookupThread.start();
+            negativeLookupThread.join(5000);
+
+            if (negativeLookupThread.isAlive()) {
+                negativeLookupThread.interrupt();
+                fail("Cached negative lookups did not finish quickly.");
+            }
+
+            assertThat(exceptions, hasSize(size));
+        } finally {
+            resolver.setNegativeTtl(oldNegativeTtl);
+        }
+    }
+
+    private static UnknownHostException resolveNonExistentDomain() {
+        try {
+            resolver.resolve("non-existent.netty.io", 0).sync();
+            fail();
+            return null;
+        } catch (Exception e) {
+            assertThat(e, is(instanceOf(UnknownHostException.class)));
+            return (UnknownHostException) e;
+        }
+    }
+
+    @Test
+    public void testResolveIp() {
+        InetSocketAddress unresolved =
+                InetSocketAddress.createUnresolved("10.0.0.1", ThreadLocalRandom.current().nextInt(65536));
+
+        InetSocketAddress address = resolver.resolve(unresolved).syncUninterruptibly().getNow();
+
+        assertEquals("10.0.0.1", address.getHostName());
+    }
+
     private static void resolve(
             Map<InetSocketAddress, Future<InetSocketAddress>> futures, String hostname) {
         InetSocketAddress unresolved =
@@ -430,5 +561,9 @@ public class DnsNameResolverTest {
             Map<String, Future<AddressedEnvelope<DnsResponse, InetSocketAddress>>> futures,
             String hostname) throws Exception {
         futures.put(hostname, resolver.query(new DefaultDnsQuestion(hostname, DnsRecordType.MX)));
+    }
+
+    private static Future<AddressedEnvelope<DnsResponse, InetSocketAddress>> queryMx(String hostname) throws Exception {
+        return resolver.query(new DefaultDnsQuestion(hostname, DnsRecordType.MX));
     }
 }

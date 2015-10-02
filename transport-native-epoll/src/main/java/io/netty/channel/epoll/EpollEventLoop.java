@@ -55,7 +55,6 @@ final class EpollEventLoop extends SingleThreadEventLoop {
     private final boolean allowGrowing;
     private final EpollEventArray events;
 
-    @SuppressWarnings("unused")
     private volatile int wakenUp;
     private volatile int ioRatio = 50;
 
@@ -291,8 +290,8 @@ final class EpollEventLoop extends SingleThreadEventLoop {
         }
         Collection<AbstractEpollChannel> array = new ArrayList<AbstractEpollChannel>(channels.size());
 
-        for (IntObjectMap.Entry<AbstractEpollChannel> entry: channels.entries()) {
-            array.add(entry.value());
+        for (AbstractEpollChannel channel: channels.values()) {
+            array.add(channel);
         }
 
         for (AbstractEpollChannel ch: array) {

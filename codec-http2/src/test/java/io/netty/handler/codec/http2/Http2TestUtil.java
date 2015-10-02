@@ -53,24 +53,17 @@ final class Http2TestUtil {
     }
 
     /**
-     * Converts a {@link String} into an {@link AsciiString}.
+     * Returns a byte array filled with random data.
      */
-    public static AsciiString as(String value) {
-        return new AsciiString(value);
-    }
-
-    /**
-     * Converts a byte array into an {@link AsciiString}.
-     */
-    public static ByteString as(byte[] value) {
-        return new ByteString(value);
+    public static byte[] randomBytes() {
+        return randomBytes(100);
     }
 
     /**
      * Returns a byte array filled with random data.
      */
-    public static byte[] randomBytes() {
-        byte[] data = new byte[100];
+    public static byte[] randomBytes(int size) {
+        byte[] data = new byte[size];
         new Random().nextBytes(data);
         return data;
     }
@@ -79,7 +72,7 @@ final class Http2TestUtil {
      * Returns an {@link AsciiString} that wraps a randomly-filled byte array.
      */
     public static ByteString randomString() {
-        return as(randomBytes());
+        return new ByteString(randomBytes());
     }
 
     private Http2TestUtil() {
@@ -96,7 +89,7 @@ final class Http2TestUtil {
         }
 
         FrameAdapter(Http2Connection connection, Http2FrameListener listener, CountDownLatch latch) {
-            this(connection, new DefaultHttp2FrameReader(), listener, latch);
+            this(connection, new DefaultHttp2FrameReader(false), listener, latch);
         }
 
         FrameAdapter(Http2Connection connection, DefaultHttp2FrameReader reader, Http2FrameListener listener,
@@ -107,7 +100,7 @@ final class Http2TestUtil {
             this.latch = latch;
         }
 
-        public Http2Stream getOrCreateStream(int streamId, boolean halfClosed) throws Http2Exception {
+        private Http2Stream getOrCreateStream(int streamId, boolean halfClosed) throws Http2Exception {
             return getOrCreateStream(connection, streamId, halfClosed);
         }
 

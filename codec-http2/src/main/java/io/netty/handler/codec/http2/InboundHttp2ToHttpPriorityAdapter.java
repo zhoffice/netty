@@ -14,20 +14,18 @@
  */
 package io.netty.handler.codec.http2;
 
-import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
-import static io.netty.handler.codec.http2.Http2Exception.connectionError;
-
-import java.util.Map.Entry;
-
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.handler.codec.TextHeaders.EntryVisitor;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.FullHttpMessage;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.util.AsciiString;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
-import io.netty.util.internal.PlatformDependent;
+
+import java.util.Map.Entry;
+
+import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
+import static io.netty.handler.codec.http2.Http2Exception.connectionError;
 
 /**
  * Translate header/data/priority HTTP/2 frame events into HTTP events.  Just as {@link InboundHttp2ToHttpAdapter}
@@ -37,11 +35,11 @@ import io.netty.util.internal.PlatformDependent;
  */
 public final class InboundHttp2ToHttpPriorityAdapter extends InboundHttp2ToHttpAdapter {
     private static final AsciiString OUT_OF_MESSAGE_SEQUENCE_METHOD = new AsciiString(
-            HttpUtil.OUT_OF_MESSAGE_SEQUENCE_METHOD.toString());
+            HttpConversionUtil.OUT_OF_MESSAGE_SEQUENCE_METHOD.toString());
     private static final AsciiString OUT_OF_MESSAGE_SEQUENCE_PATH = new AsciiString(
-            HttpUtil.OUT_OF_MESSAGE_SEQUENCE_PATH);
+            HttpConversionUtil.OUT_OF_MESSAGE_SEQUENCE_PATH);
     private static final AsciiString OUT_OF_MESSAGE_SEQUENCE_RETURN_CODE = new AsciiString(
-            HttpUtil.OUT_OF_MESSAGE_SEQUENCE_RETURN_CODE.toString());
+            HttpConversionUtil.OUT_OF_MESSAGE_SEQUENCE_RETURN_CODE.toString());
     private final IntObjectMap<HttpHeaders> outOfMessageFlowHeaders;
 
     public static final class Builder extends InboundHttp2ToHttpAdapter.Builder {
@@ -114,8 +112,8 @@ public final class InboundHttp2ToHttpPriorityAdapter extends InboundHttp2ToHttpA
      * @param headers The headers to remove the priority tree elements from
      */
     private static void removePriorityRelatedHeaders(HttpHeaders headers) {
-        headers.remove(HttpUtil.ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text());
-        headers.remove(HttpUtil.ExtensionHeaderNames.STREAM_WEIGHT.text());
+        headers.remove(HttpConversionUtil.ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text());
+        headers.remove(HttpConversionUtil.ExtensionHeaderNames.STREAM_WEIGHT.text());
     }
 
     /**
@@ -136,16 +134,8 @@ public final class InboundHttp2ToHttpPriorityAdapter extends InboundHttp2ToHttpA
      * @param http2Headers The target HTTP/2 headers
      */
     private static void addHttpHeadersToHttp2Headers(HttpHeaders httpHeaders, final Http2Headers http2Headers) {
-        try {
-            httpHeaders.forEachEntry(new EntryVisitor() {
-                @Override
-                public boolean visit(Entry<CharSequence, CharSequence> entry) throws Exception {
-                    http2Headers.add(AsciiString.of(entry.getKey()), AsciiString.of(entry.getValue()));
-                    return true;
-                }
-            });
-        } catch (Exception ex) {
-            PlatformDependent.throwException(ex);
+        for (Entry<CharSequence, CharSequence> entry : httpHeaders) {
+            http2Headers.add(AsciiString.of(entry.getKey()), AsciiString.of(entry.getValue()));
         }
     }
 
@@ -176,7 +166,7 @@ public final class InboundHttp2ToHttpPriorityAdapter extends InboundHttp2ToHttpA
             // and the HTTP message flow exists in OPEN.
             if (parent != null && !parent.equals(connection.connectionStream())) {
                 HttpHeaders headers = new DefaultHttpHeaders();
-                headers.setInt(HttpUtil.ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text(), parent.id());
+                headers.setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text(), parent.id());
                 importOutOfMessageFlowHeaders(stream.id(), headers);
             }
         } else {
@@ -185,7 +175,7 @@ public final class InboundHttp2ToHttpPriorityAdapter extends InboundHttp2ToHttpA
                 removePriorityRelatedHeaders(msg.trailingHeaders());
             } else if (!parent.equals(connection.connectionStream())) {
                 HttpHeaders headers = getActiveHeaders(msg);
-                headers.setInt(HttpUtil.ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text(), parent.id());
+                headers.setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text(), parent.id());
             }
         }
     }
@@ -203,7 +193,7 @@ public final class InboundHttp2ToHttpPriorityAdapter extends InboundHttp2ToHttpA
         } else {
             headers = getActiveHeaders(msg);
         }
-        headers.setShort(HttpUtil.ExtensionHeaderNames.STREAM_WEIGHT.text(), stream.weight());
+        headers.setShort(HttpConversionUtil.ExtensionHeaderNames.STREAM_WEIGHT.text(), stream.weight());
     }
 
     @Override

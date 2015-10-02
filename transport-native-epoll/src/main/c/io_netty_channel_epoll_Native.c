@@ -26,18 +26,34 @@
 #include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <linux/socket.h> // SOL_TCP definition
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/utsname.h>
 #include <stddef.h>
 #include <limits.h>
+#include <inttypes.h>
 #include "io_netty_channel_epoll_Native.h"
 #include "exception_helper.h"
 
 // TCP_NOTSENT_LOWAT is defined in linux 3.12. We define this here so older kernels can compile.
 #ifndef TCP_NOTSENT_LOWAT
 #define TCP_NOTSENT_LOWAT 25
+#endif
+
+
+#ifndef _KERNEL_FASTOPEN
+#define _KERNEL_FASTOPEN
+// conditional define for TCP_FASTOPEN mostly on ubuntu
+#ifndef TCP_FASTOPEN
+#define TCP_FASTOPEN   23
+#endif
+
+// conditional define for SOL_TCP mostly on ubuntu
+#ifndef SOL_TCP
+#define SOL_TCP 6
+#endif
 #endif
 
 /**
@@ -86,6 +102,7 @@ jfieldID packetCountFieldId = NULL;
 jmethodID inetSocketAddrMethodId = NULL;
 jmethodID datagramSocketAddrMethodId = NULL;
 jclass runtimeExceptionClass = NULL;
+jclass channelExceptionClass = NULL;
 jclass ioExceptionClass = NULL;
 jclass closedChannelExceptionClass = NULL;
 jmethodID closedChannelExceptionMethodId = NULL;
@@ -109,6 +126,12 @@ void throwRuntimeExceptionErrorNo(JNIEnv* env, char* message, int errorNumber) {
     free(allocatedMessage);
 }
 
+void throwChannelExceptionErrorNo(JNIEnv* env, char* message, int errorNumber) {
+    char* allocatedMessage = exceptionMessage(message, errorNumber);
+    (*env)->ThrowNew(env, channelExceptionClass, allocatedMessage);
+    free(allocatedMessage);
+}
+
 void throwIOException(JNIEnv* env, char* message) {
     (*env)->ThrowNew(env, ioExceptionClass, message);
 }
@@ -127,6 +150,20 @@ void throwClosedChannelException(JNIEnv* env) {
 void throwOutOfMemoryError(JNIEnv* env) {
     jclass exceptionClass = (*env)->FindClass(env, "java/lang/OutOfMemoryError");
     (*env)->ThrowNew(env, exceptionClass, "");
+}
+
+static int getSysctlValue(const char * property, int* returnValue) {
+    int rc = -1;
+    FILE *fd=fopen(property, "r");
+    if (fd != NULL) {
+      char buf[32] = {0x0};
+      if (fgets(buf, 32, fd) != NULL) {
+        *returnValue = atoi(buf);
+        rc = 0;
+      }
+      fclose(fd);
+    }
+    return rc;
 }
 
 /** Notice: every usage of exceptionMessage needs to release the allocated memory for the sequence of char */
@@ -163,7 +200,7 @@ static inline jint getOption(JNIEnv* env, jint fd, int level, int optname, void*
         return 0;
     }
     int err = errno;
-    throwRuntimeExceptionErrorNo(env, "getsockopt() failed: ", err);
+    throwChannelExceptionErrorNo(env, "getsockopt() failed: ", err);
     return code;
 }
 
@@ -171,7 +208,7 @@ static inline int setOption(JNIEnv* env, jint fd, int level, int optname, const 
     int rc = setsockopt(fd, level, optname, optval, len);
     if (rc < 0) {
         int err = errno;
-        throwRuntimeExceptionErrorNo(env, "setsockopt() failed: ", err);
+        throwChannelExceptionErrorNo(env, "setsockopt() failed: ", err);
     }
     return rc;
 }
@@ -387,6 +424,18 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
         }
         runtimeExceptionClass = (jclass) (*env)->NewGlobalRef(env, localRuntimeExceptionClass);
         if (runtimeExceptionClass == NULL) {
+            // out-of-memory!
+            throwOutOfMemoryError(env);
+            return JNI_ERR;
+        }
+
+        jclass localChannelExceptionClass = (*env)->FindClass(env, "io/netty/channel/ChannelException");
+        if (localChannelExceptionClass == NULL) {
+            // pending exception...
+            return JNI_ERR;
+        }
+        channelExceptionClass = (jclass) (*env)->NewGlobalRef(env, localChannelExceptionClass);
+        if (channelExceptionClass == NULL) {
             // out-of-memory!
             throwOutOfMemoryError(env);
             return JNI_ERR;
@@ -619,6 +668,9 @@ void JNI_OnUnload(JavaVM* vm, void* reserved) {
         if (runtimeExceptionClass != NULL) {
             (*env)->DeleteGlobalRef(env, runtimeExceptionClass);
         }
+        if (channelExceptionClass != NULL) {
+            (*env)->DeleteGlobalRef(env, channelExceptionClass);
+        }
         if (ioExceptionClass != NULL) {
             (*env)->DeleteGlobalRef(env, ioExceptionClass);
         }
@@ -642,7 +694,7 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_eventFd(JNIEnv* env, j
 
     if (eventFD < 0) {
         int err = errno;
-        throwRuntimeExceptionErrorNo(env, "eventfd() failed: ", err);
+        throwChannelExceptionErrorNo(env, "eventfd() failed: ", err);
     }
     return eventFD;
 }
@@ -652,7 +704,7 @@ JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_eventFdWrite(JNIEnv* e
 
     if (eventFD < 0) {
         int err = errno;
-        throwRuntimeExceptionErrorNo(env, "eventfd_write() failed: ", err);
+        throwChannelExceptionErrorNo(env, "eventfd_write() failed: ", err);
     }
 }
 
@@ -676,9 +728,9 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_epollCreate(JNIEnv* en
     if (efd < 0) {
         int err = errno;
         if (epoll_create1) {
-            throwRuntimeExceptionErrorNo(env, "epoll_create1() failed: ", err);
+            throwChannelExceptionErrorNo(env, "epoll_create1() failed: ", err);
         } else {
-            throwRuntimeExceptionErrorNo(env, "epoll_create() failed: ", err);
+            throwChannelExceptionErrorNo(env, "epoll_create() failed: ", err);
         }
         return efd;
     }
@@ -686,7 +738,7 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_epollCreate(JNIEnv* en
         if (fcntl(efd, F_SETFD, FD_CLOEXEC) < 0) {
             int err = errno;
             close(efd);
-            throwRuntimeExceptionErrorNo(env, "fcntl() failed: ", err);
+            throwChannelExceptionErrorNo(env, "fcntl() failed: ", err);
             return err;
         }
     }
@@ -1006,6 +1058,8 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_shutdown0(JNIEnv* env,
         mode = SHUT_RD;
     } else if (write) {
         mode = SHUT_WR;
+    } else {
+        return -EINVAL;
     }
     if (shutdown(fd, mode) < 0) {
         return -errno;
@@ -1046,12 +1100,14 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_bind(JNIEnv* env, jcla
     if (bind(fd, (struct sockaddr*) &addr, sizeof(addr)) == -1) {
         return -errno;
     }
+    return 0;
 }
 
 JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_listen0(JNIEnv* env, jclass clazz, jint fd, jint backlog) {
     if (listen(fd, backlog) == -1) {
         return -errno;
     }
+    return 0;
 }
 
 JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_connect(JNIEnv* env, jclass clazz, jint fd, jbyteArray address, jint scopeId, jint port) {
@@ -1212,15 +1268,15 @@ JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTcpCork(JNIEnv* env
     setOption(env, fd, IPPROTO_TCP, TCP_CORK, &optval, sizeof(optval));
 }
 
+JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTcpFastopen(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+    setOption(env, fd, SOL_TCP, TCP_FASTOPEN, &optval, sizeof(optval));
+}
+
 JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTcpNotSentLowAt(JNIEnv* env, jclass clazz, jint fd, jint optval) {
     setOption(env, fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &optval, sizeof(optval));
 }
 
 JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setSoLinger(JNIEnv* env, jclass clazz, jint fd, jint optval) {
-    setOption(env, fd, IPPROTO_IP, IP_TOS, &optval, sizeof(optval));
-}
-
-JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTrafficClass(JNIEnv* env, jclass clazz, jint fd, jint optval) {
     struct linger solinger;
     if (optval < 0) {
         solinger.l_onoff = 0;
@@ -1230,6 +1286,10 @@ JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTrafficClass(JNIEnv
         solinger.l_linger = optval;
     }
     setOption(env, fd, SOL_SOCKET, SO_LINGER, &solinger, sizeof(solinger));
+}
+
+JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTrafficClass(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+    setOption(env, fd, IPPROTO_IP, IP_TOS, &optval, sizeof(optval));
 }
 
 JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setBroadcast(JNIEnv* env, jclass clazz, jint fd, jint optval) {
@@ -1246,6 +1306,14 @@ JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTcpKeepIntvl(JNIEnv
 
 JNIEXPORT void Java_io_netty_channel_epoll_Native_setTcpKeepCnt(JNIEnv* env, jclass clazz, jint fd, jint optval) {
     setOption(env, fd, IPPROTO_TCP, TCP_KEEPCNT, &optval, sizeof(optval));
+}
+
+JNIEXPORT void Java_io_netty_channel_epoll_Native_setTcpUserTimeout(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+    setOption(env, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &optval, sizeof(optval));
+}
+
+JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setIpFreeBind(JNIEnv* env, jclass clazz, jint fd, jint optval) {
+    setOption(env, fd, IPPROTO_IP, IP_FREEBIND, &optval, sizeof(optval));
 }
 
 JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_isReuseAddresss(JNIEnv* env, jclass clazz, jint fd) {
@@ -1364,6 +1432,22 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_getTcpKeepCnt(JNIEnv* 
      return optval;
 }
 
+JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_getTcpUserTimeout(JNIEnv* env, jclass clazz, jint fd) {
+     int optval;
+     if (getOption(env, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &optval, sizeof(optval)) == -1) {
+         return -1;
+     }
+     return optval;
+}
+
+JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_isIpFreeBind(JNIEnv* env, jclass clazz, jint fd) {
+     int optval;
+     if (getOption(env, fd, IPPROTO_TCP, IP_FREEBIND, &optval, sizeof(optval)) == -1) {
+         return -1;
+     }
+     return optval;
+}
+
 JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_tcpInfo0(JNIEnv* env, jclass clazz, jint fd, jintArray array) {
      struct tcp_info tcp_info;
      if (getOption(env, fd, IPPROTO_TCP, TCP_INFO, &tcp_info, sizeof(tcp_info)) == -1) {
@@ -1433,6 +1517,15 @@ JNIEXPORT jboolean JNICALL Java_io_netty_channel_epoll_Native_isSupportingSendmm
     return JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL Java_io_netty_channel_epoll_Native_isSupportingTcpFastopen(JNIEnv* env, jclass clazz) {
+    int fastopen = 0;
+    getSysctlValue("/proc/sys/net/ipv4/tcp_fastopen", &fastopen);
+    if (fastopen > 0) {
+        return JNI_TRUE;
+    }
+    return JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_errnoEBADF(JNIEnv* env, jclass clazz) {
     return EBADF;
 }
@@ -1470,21 +1563,29 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_socketDomain(JNIEnv* e
     return fd;
 }
 
-JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_bindDomainSocket(JNIEnv* env, jclass clazz, jint fd, jstring socketPath) {
+// macro to calculate the length of a sockaddr_un struct for a given path length.
+// see sys/un.h#SUN_LEN, this is modified to allow nul bytes
+#define _UNIX_ADDR_LENGTH(path_len) (uintptr_t) (((struct sockaddr_un *) 0)->sun_path) + path_len
+
+JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_bindDomainSocket(JNIEnv* env, jclass clazz, jint fd, jbyteArray socketPath) {
     struct sockaddr_un addr;
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
 
-    const char* socket_path = (*env)->GetStringUTFChars(env, socketPath, 0);
-    memcpy(addr.sun_path, socket_path, strlen(socket_path));
+    jbyte* socket_path = (*env)->GetByteArrayElements(env, socketPath, 0);
+    jint socket_path_len = (*env)->GetArrayLength(env, socketPath);
+    if (socket_path_len > sizeof(addr.sun_path)) {
+        socket_path_len = sizeof(addr.sun_path);
+    }
+    memcpy(addr.sun_path, socket_path, socket_path_len);
 
     if (unlink(socket_path) == -1 && errno != ENOENT) {
         return -errno;
     }
 
-    int res = bind(fd, (struct sockaddr*) &addr, sizeof(addr));
-    (*env)->ReleaseStringUTFChars(env, socketPath, socket_path);
+    int res = bind(fd, (struct sockaddr*) &addr, _UNIX_ADDR_LENGTH(socket_path_len));
+    (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
 
     if (res == -1) {
         return -errno;
@@ -1492,22 +1593,27 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_bindDomainSocket(JNIEn
     return res;
 }
 
-JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_connectDomainSocket(JNIEnv* env, jclass clazz, jint fd, jstring socketPath) {
+JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_connectDomainSocket(JNIEnv* env, jclass clazz, jint fd, jbyteArray socketPath) {
     struct sockaddr_un addr;
+    jint socket_path_len;
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
 
-    const char* socket_path = (*env)->GetStringUTFChars(env, socketPath, 0);
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    jbyte* socket_path = (*env)->GetByteArrayElements(env, socketPath, 0);
+    socket_path_len = (*env)->GetArrayLength(env, socketPath);
+    if (socket_path_len > sizeof(addr.sun_path)) {
+        socket_path_len = sizeof(addr.sun_path);
+    }
+    memcpy(addr.sun_path, socket_path, socket_path_len);
 
     int res;
     int err;
     do {
-        res = connect(fd, (struct sockaddr*) &addr, sizeof(addr));
+        res = connect(fd, (struct sockaddr*) &addr, _UNIX_ADDR_LENGTH(socket_path_len));
     } while (res == -1 && ((err = errno) == EINTR));
 
-    (*env)->ReleaseStringUTFChars(env, socketPath, socket_path);
+    (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
 
     if (res < 0) {
         return -err;
@@ -1584,7 +1690,7 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_sendFd0(JNIEnv* env, j
         iov[0].iov_base = iovecData;
         iov[0].iov_len = sizeof(iovecData);
 
-        size_t res;
+        ssize_t res;
         int err;
         do {
             res = sendmsg(socketFd, &descriptorMessage, 0);
@@ -1657,14 +1763,17 @@ JNIEXPORT jlong JNICALL Java_io_netty_channel_epoll_Native_pipe0(JNIEnv* env, jc
     return (((long) fd[0]) << 32) | (fd[1] & 0xffffffffL);
 }
 
-JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_splice0(JNIEnv* env, jclass clazz, jint fd, jint offIn, jint fdOut, jint offOut, jint len) {
+JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_splice0(JNIEnv* env, jclass clazz, jint fd, jlong offIn, jint fdOut, jlong offOut, jlong len) {
     ssize_t res;
     int err;
-    loff_t off_in = offIn >= 0 ? (loff_t) offIn : NULL;
-    loff_t off_out = offOut >= 0 ? (loff_t) offOut : NULL;
+    loff_t off_in = (loff_t) offIn;
+    loff_t off_out = (loff_t) offOut;
+
+    loff_t* p_off_in = off_in >= 0 ? &off_in : NULL;
+    loff_t* p_off_out = off_in >= 0 ? &off_out : NULL;
 
     do {
-       res = splice(fd, off_in, fdOut, off_out, (size_t) len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+       res = splice(fd, p_off_in, fdOut, p_off_out, (size_t) len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
        // keep on splicing if it was interrupted
     } while (res == -1 && ((err = errno) == EINTR));
 
@@ -1676,4 +1785,52 @@ JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_splice0(JNIEnv* env, j
 
 JNIEXPORT jlong JNICALL Java_io_netty_channel_epoll_Native_ssizeMax(JNIEnv* env, jclass clazz) {
     return SSIZE_MAX;
+}
+
+JNIEXPORT jint JNICALL Java_io_netty_channel_epoll_Native_tcpMd5SigMaxKeyLen(JNIEnv* env, jclass clazz) {
+    struct tcp_md5sig md5sig;
+
+    // Defensive size check
+    if (sizeof(md5sig.tcpm_key) < TCP_MD5SIG_MAXKEYLEN) {
+        return sizeof(md5sig.tcpm_key);
+    }
+
+    return TCP_MD5SIG_MAXKEYLEN;
+}
+
+JNIEXPORT void JNICALL Java_io_netty_channel_epoll_Native_setTcpMd5Sig0(JNIEnv* env, jclass clazz, jint fd, jbyteArray address, jint scopeId, jbyteArray key) {
+    struct sockaddr_storage addr;
+    if (init_sockaddr(env, address, scopeId, 0, &addr) == -1) {
+        return;
+    }
+
+    struct tcp_md5sig md5sig;
+    memset(&md5sig, 0, sizeof(md5sig));
+    md5sig.tcpm_addr.ss_family = addr.ss_family;
+
+    struct sockaddr_in* ipaddr;
+    struct sockaddr_in6* ip6addr;
+
+    switch (addr.ss_family) {
+    case AF_INET:
+        ipaddr = (struct sockaddr_in*) &addr;
+        memcpy(&((struct sockaddr_in *) &md5sig.tcpm_addr)->sin_addr, &ipaddr->sin_addr, sizeof(ipaddr->sin_addr));
+        break;
+    case AF_INET6:
+        ip6addr = (struct sockaddr_in6*) &addr;
+        memcpy(&((struct sockaddr_in6 *) &md5sig.tcpm_addr)->sin6_addr, &ip6addr->sin6_addr, sizeof(ip6addr->sin6_addr));
+        break;
+    }
+
+    if (key != NULL) {
+        md5sig.tcpm_keylen = (*env)->GetArrayLength(env, key);
+        (*env)->GetByteArrayRegion(env, key, 0, md5sig.tcpm_keylen, (void *) &md5sig.tcpm_key);
+        if ((*env)->ExceptionCheck(env) == JNI_TRUE) {
+            return;
+        }
+    }
+
+    if (setsockopt(fd, IPPROTO_TCP, TCP_MD5SIG, &md5sig, sizeof(md5sig)) < 0) {
+        throwChannelExceptionErrorNo(env, "setsockopt() failed: ", errno);
+    }
 }

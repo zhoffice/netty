@@ -14,86 +14,62 @@
  */
 package io.netty.handler.codec.http2;
 
-import static io.netty.util.internal.StringUtil.UPPER_CASE_TO_LOWER_CASE_ASCII_OFFSET;
-import io.netty.handler.codec.BinaryHeaders;
-import io.netty.handler.codec.DefaultBinaryHeaders;
-import io.netty.util.AsciiString;
+import static io.netty.handler.codec.http2.Http2Exception.connectionError;
+import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
+import io.netty.handler.codec.ByteStringValueConverter;
+import io.netty.handler.codec.DefaultHeaders;
+import io.netty.handler.codec.Headers;
 import io.netty.util.ByteProcessor;
 import io.netty.util.ByteString;
 import io.netty.util.internal.PlatformDependent;
 
-public class DefaultHttp2Headers extends DefaultBinaryHeaders implements Http2Headers {
-    private static final ByteProcessor HTTP2_ASCII_UPPERCASE_PROCESSOR = new ByteProcessor() {
+public class DefaultHttp2Headers extends DefaultHeaders<ByteString> implements Http2Headers {
+    private static final ByteProcessor HTTP2_NAME_VALIDATOR_PROCESSOR = new ByteProcessor() {
         @Override
         public boolean process(byte value) throws Exception {
             return value < 'A' || value > 'Z';
         }
     };
-
-    private static final class Http2AsciiToLowerCaseConverter implements ByteProcessor {
-        private final byte[] result;
-        private int i;
-
-        public Http2AsciiToLowerCaseConverter(int length) {
-            result = new byte[length];
-        }
-
+    private static final NameValidator<ByteString> HTTP2_NAME_VALIDATOR = new NameValidator<ByteString>() {
         @Override
-        public boolean process(byte value) throws Exception {
-            result[i++] = (value >= 'A' && value <= 'Z')
-                    ? (byte) (value + UPPER_CASE_TO_LOWER_CASE_ASCII_OFFSET) : value;
-            return true;
-        }
-
-        public byte[] result() {
-            return result;
-        }
-    };
-
-    private static final NameConverter<ByteString> HTTP2_ASCII_TO_LOWER_CONVERTER = new NameConverter<ByteString>() {
-        @Override
-        public ByteString convertName(ByteString name) {
-            if (name instanceof AsciiString) {
-                return ((AsciiString) name).toLowerCase();
-            }
-
+        public void validateName(ByteString name) {
+            final int index;
             try {
-                if (name.forEachByte(HTTP2_ASCII_UPPERCASE_PROCESSOR) == -1) {
-                    return name;
-                }
-
-                Http2AsciiToLowerCaseConverter converter = new Http2AsciiToLowerCaseConverter(name.length());
-                name.forEachByte(converter);
-                return new ByteString(converter.result(), false);
-            } catch (Exception e) {
+                index = name.forEachByte(HTTP2_NAME_VALIDATOR_PROCESSOR);
+            } catch (Http2Exception e) {
                 PlatformDependent.throwException(e);
-                return null;
+                return;
+            } catch (Throwable t) {
+                PlatformDependent.throwException(connectionError(PROTOCOL_ERROR, t,
+                        "unexpected error. invalid header name [%s]", name));
+                return;
+            }
+
+            if (index != -1) {
+                PlatformDependent.throwException(connectionError(PROTOCOL_ERROR, "invalid header name [%s]", name));
             }
         }
     };
+    private HeaderEntry<ByteString> firstNonPseudo = head;
 
     /**
-     * Creates an instance that will convert all header names to lowercase.
+     * Create a new instance.
+     * <p>
+     * Header names will be validated according to
+     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>.
      */
     public DefaultHttp2Headers() {
         this(true);
     }
 
     /**
-     * Creates an instance that can be configured to either do header field name conversion to
-     * lowercase, or not do any conversion at all.
-     * <p>
-     *
-     * <strong>Note</strong> that setting {@code forceKeyToLower} to {@code false} can violate the
-     * <a href="https://tools.ietf.org/html/draft-ietf-httpbis-http2-16#section-8.1.2">HTTP/2 specification</a>
-     * which specifies that a request or response containing an uppercase header field MUST be treated
-     * as malformed. Only set {@code forceKeyToLower} to {@code false} if you are explicitly using lowercase
-     * header field names and want to avoid the conversion to lowercase.
-     *
-     * @param forceKeyToLower if @{code false} no header name conversion will be performed
+     * Create a new instance.
+     * @param validate {@code true} to validate header names according to
+     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>. {@code false} to not validate header names.
      */
-    public DefaultHttp2Headers(boolean forceKeyToLower) {
-        super(forceKeyToLower ? HTTP2_ASCII_TO_LOWER_CONVERTER : IDENTITY_NAME_CONVERTER);
+    @SuppressWarnings("unchecked")
+    public DefaultHttp2Headers(boolean validate) {
+        super(ByteStringValueConverter.INSTANCE, validate ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL);
     }
 
     @Override
@@ -187,7 +163,7 @@ public class DefaultHttp2Headers extends DefaultBinaryHeaders implements Http2He
     }
 
     @Override
-    public Http2Headers add(BinaryHeaders headers) {
+    public Http2Headers add(Headers<? extends ByteString> headers) {
         super.add(headers);
         return this;
     }
@@ -283,13 +259,13 @@ public class DefaultHttp2Headers extends DefaultBinaryHeaders implements Http2He
     }
 
     @Override
-    public Http2Headers set(BinaryHeaders headers) {
+    public Http2Headers set(Headers<? extends ByteString> headers) {
         super.set(headers);
         return this;
     }
 
     @Override
-    public Http2Headers setAll(BinaryHeaders headers) {
+    public Http2Headers setAll(Headers<? extends ByteString> headers) {
         super.setAll(headers);
         return this;
     }
@@ -353,5 +329,40 @@ public class DefaultHttp2Headers extends DefaultBinaryHeaders implements Http2He
     @Override
     public ByteString status() {
         return get(PseudoHeaderName.STATUS.value());
+    }
+
+    @Override
+    protected final HeaderEntry<ByteString> newHeaderEntry(int h, ByteString name, ByteString value,
+                                                           HeaderEntry<ByteString> next) {
+        return new Http2HeaderEntry(h, name, value, next);
+    }
+
+    private final class Http2HeaderEntry extends HeaderEntry<ByteString> {
+        protected Http2HeaderEntry(int hash, ByteString key, ByteString value, HeaderEntry<ByteString> next) {
+            super(hash, key);
+            this.value = value;
+            this.next = next;
+
+            // Make sure the pseudo headers fields are first in iteration order
+            if (!key.isEmpty() && key.byteAt(0) == ':') {
+                after = firstNonPseudo;
+                before = firstNonPseudo.before();
+            } else {
+                after = head;
+                before = head.before();
+                if (firstNonPseudo == head) {
+                    firstNonPseudo = this;
+                }
+            }
+            pointNeighborsToThis();
+        }
+
+        @Override
+        protected void remove() {
+            if (this == firstNonPseudo) {
+                firstNonPseudo = firstNonPseudo.after();
+            }
+            super.remove();
+        }
     }
 }

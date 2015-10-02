@@ -141,7 +141,7 @@ public class HttpPostRequestDecoder implements InterfaceHttpPostRequestDecoder {
      */
     public static boolean isMultipart(HttpRequest request) {
         if (request.headers().contains(HttpHeaderNames.CONTENT_TYPE)) {
-            return getMultipartDataBoundary(request.headers().getAndConvert(HttpHeaderNames.CONTENT_TYPE)) != null;
+            return getMultipartDataBoundary(request.headers().getAsString(HttpHeaderNames.CONTENT_TYPE)) != null;
         } else {
             return false;
         }
@@ -236,6 +236,11 @@ public class HttpPostRequestDecoder implements InterfaceHttpPostRequestDecoder {
     @Override
     public InterfaceHttpData next() {
         return decoder.next();
+    }
+
+    @Override
+    public InterfaceHttpData currentPartialHttpData() {
+        return decoder.currentPartialHttpData();
     }
 
     @Override

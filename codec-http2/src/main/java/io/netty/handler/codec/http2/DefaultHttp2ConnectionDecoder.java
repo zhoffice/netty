@@ -44,25 +44,22 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
     private Http2LifecycleManager lifecycleManager;
     private final Http2ConnectionEncoder encoder;
     private final Http2FrameReader frameReader;
-    private final Http2FrameListener listener;
+    private Http2FrameListener listener;
     private final Http2PromisedRequestVerifier requestVerifier;
 
     public DefaultHttp2ConnectionDecoder(Http2Connection connection,
                                          Http2ConnectionEncoder encoder,
-                                         Http2FrameReader frameReader,
-                                         Http2FrameListener listener) {
-        this(connection, encoder, frameReader, listener, ALWAYS_VERIFY);
+                                         Http2FrameReader frameReader) {
+        this(connection, encoder, frameReader, ALWAYS_VERIFY);
     }
 
     public DefaultHttp2ConnectionDecoder(Http2Connection connection,
                                          Http2ConnectionEncoder encoder,
                                          Http2FrameReader frameReader,
-                                         Http2FrameListener listener,
                                          Http2PromisedRequestVerifier requestVerifier) {
         this.connection = checkNotNull(connection, "connection");
         this.frameReader = checkNotNull(frameReader, "frameReader");
         this.encoder = checkNotNull(encoder, "encoder");
-        this.listener = checkNotNull(listener, "listener");
         this.requestVerifier = checkNotNull(requestVerifier, "requestVerifier");
         if (connection.local().flowController() == null) {
             connection.local().flowController(
@@ -86,7 +83,12 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
     }
 
     @Override
-    public Http2FrameListener listener() {
+    public void frameListener(Http2FrameListener listener) {
+        this.listener = checkNotNull(listener, "listener");
+    }
+
+    @Override
+    public Http2FrameListener frameListener() {
         return listener;
     }
 
@@ -192,8 +194,8 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
             if (stream == null || stream.isResetSent() || streamCreatedAfterGoAwaySent(streamId)) {
                 // Ignoring this frame. We still need to count the frame towards the connection flow control
                 // window, but we immediately mark all bytes as consumed.
-                flowController.receiveFlowControlledFrame(ctx, stream, data, padding, endOfStream);
-                flowController.consumeBytes(ctx, stream, bytesToReturn);
+                flowController.receiveFlowControlledFrame(stream, data, padding, endOfStream);
+                flowController.consumeBytes(stream, bytesToReturn);
 
                 // Verify that the stream may have existed after we apply flow control.
                 verifyStreamMayHaveExisted(streamId);
@@ -220,7 +222,7 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
 
             int unconsumedBytes = unconsumedBytes(stream);
             try {
-                flowController.receiveFlowControlledFrame(ctx, stream, data, padding, endOfStream);
+                flowController.receiveFlowControlledFrame(stream, data, padding, endOfStream);
                 // Update the unconsumed bytes after flow control is applied.
                 unconsumedBytes = unconsumedBytes(stream);
 
@@ -249,9 +251,7 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
                 throw e;
             } finally {
                 // If appropriate, return the processed bytes to the flow controller.
-                if (bytesToReturn > 0) {
-                    flowController.consumeBytes(ctx, stream, bytesToReturn);
-                }
+                flowController.consumeBytes(stream, bytesToReturn);
 
                 if (endOfStream) {
                     lifecycleManager.closeStreamRemote(stream, ctx.newSucceededFuture());
@@ -516,7 +516,7 @@ public class DefaultHttp2ConnectionDecoder implements Http2ConnectionDecoder {
             }
 
             // Update the outbound flow control window.
-            encoder.flowController().incrementWindowSize(ctx, stream, windowSizeIncrement);
+            encoder.flowController().incrementWindowSize(stream, windowSizeIncrement);
 
             listener.onWindowUpdateRead(ctx, streamId, windowSizeIncrement);
         }

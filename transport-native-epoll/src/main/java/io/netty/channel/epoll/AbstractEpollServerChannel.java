@@ -17,18 +17,20 @@ package io.netty.channel.epoll;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelConfig;
+import io.netty.channel.ChannelMetadata;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.EventLoop;
+import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.ServerChannel;
 import io.netty.channel.unix.FileDescriptor;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 
-
 public abstract class AbstractEpollServerChannel extends AbstractEpollChannel implements ServerChannel {
+    private static final ChannelMetadata METADATA = new ChannelMetadata(false, 16);
 
     protected AbstractEpollServerChannel(int fd) {
         super(fd, Native.EPOLLIN);
@@ -36,6 +38,11 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
 
     protected AbstractEpollServerChannel(FileDescriptor fd) {
         super(null, fd, Native.EPOLLIN, Native.getSoError(fd.intValue()) == 0);
+    }
+
+    @Override
+    public ChannelMetadata metadata() {
+        return METADATA;
     }
 
     @Override
@@ -66,7 +73,7 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
     abstract Channel newChildChannel(int fd, byte[] remote, int offset, int len) throws Exception;
 
     final class EpollServerSocketUnsafe extends AbstractEpollUnsafe {
-        // Will hold the remote address after accept(...) was sucesssful.
+        // Will hold the remote address after accept(...) was successful.
         // We need 24 bytes for the address as maximum + 1 byte for storing the length.
         // So use 26 bytes as it's a power of two.
         private final byte[] acceptedAddress = new byte[26];
@@ -75,6 +82,11 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
         public void connect(SocketAddress socketAddress, SocketAddress socketAddress2, ChannelPromise channelPromise) {
             // Connect not supported by ServerChannel implementations
             channelPromise.setFailure(new UnsupportedOperationException());
+        }
+
+        @Override
+        protected EpollRecvByteAllocatorHandle newEpollHandle(RecvByteBufAllocator.Handle handle) {
+            return new EpollRecvByteAllocatorMessageHandle(handle, isFlagSet(Native.EPOLLET));
         }
 
         @Override
@@ -90,13 +102,12 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
             }
 
             final ChannelPipeline pipeline = pipeline();
+            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
+            allocHandle.reset(config);
+
             Throwable exception = null;
             try {
                 try {
-                    // if edgeTriggered is used we need to read all messages as we are not notified again otherwise.
-                    final int maxMessagesPerRead = edgeTriggered
-                            ? Integer.MAX_VALUE : config.getMaxMessagesPerRead();
-                    int messages = 0;
                     do {
                         int socketFd = Native.accept(fd().intValue(), acceptedAddress);
                         if (socketFd == -1) {
@@ -104,30 +115,20 @@ public abstract class AbstractEpollServerChannel extends AbstractEpollChannel im
                             break;
                         }
                         readPending = false;
+                        allocHandle.incMessagesRead(1);
 
-                        try {
-                            int len = acceptedAddress[0];
-                            pipeline.fireChannelRead(newChildChannel(socketFd, acceptedAddress, 1, len));
-                        } catch (Throwable t) {
-                            // keep on reading as we use epoll ET and need to consume everything from the socket
-                            pipeline.fireChannelReadComplete();
-                            pipeline.fireExceptionCaught(t);
-                        } finally {
-                            if (!edgeTriggered && !config.isAutoRead()) {
-                                // This is not using EPOLLET so we can stop reading
-                                // ASAP as we will get notified again later with
-                                // pending data
-                                break;
-                            }
-                        }
-                    } while (++ messages < maxMessagesPerRead);
+                        int len = acceptedAddress[0];
+                        pipeline.fireChannelRead(newChildChannel(socketFd, acceptedAddress, 1, len));
+                    } while (allocHandle.continueReading());
                 } catch (Throwable t) {
                     exception = t;
                 }
+                allocHandle.readComplete();
                 pipeline.fireChannelReadComplete();
 
                 if (exception != null) {
                     pipeline.fireExceptionCaught(exception);
+                    checkResetEpollIn(edgeTriggered);
                 }
             } finally {
                 // Check if there is a readPending which was not processed yet.

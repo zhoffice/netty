@@ -31,14 +31,14 @@ public final class HttpHeaderUtil {
      */
     public static boolean isKeepAlive(HttpMessage message) {
         CharSequence connection = message.headers().get(HttpHeaderNames.CONNECTION);
-        if (connection != null && HttpHeaderValues.CLOSE.equalsIgnoreCase(connection)) {
+        if (connection != null && HttpHeaderValues.CLOSE.contentEqualsIgnoreCase(connection)) {
             return false;
         }
 
         if (message.protocolVersion().isKeepAliveDefault()) {
-            return !HttpHeaderValues.CLOSE.equalsIgnoreCase(connection);
+            return !HttpHeaderValues.CLOSE.contentEqualsIgnoreCase(connection);
         } else {
-            return HttpHeaderValues.KEEP_ALIVE.equalsIgnoreCase(connection);
+            return HttpHeaderValues.KEEP_ALIVE.contentEqualsIgnoreCase(connection);
         }
     }
 
@@ -135,6 +135,16 @@ public final class HttpHeaderUtil {
     }
 
     /**
+     * Get an {@code int} representation of {@link #getContentLength(HttpMessage, long)}.
+     * @return the content length or {@code defaultValue} if this message does
+     *         not have the {@code "Content-Length"} header or its value is not
+     *         a number. Not to exceed the boundaries of integer.
+     */
+    public static int getContentLength(HttpMessage message, int defaultValue) {
+        return (int) Math.min(Integer.MAX_VALUE, HttpHeaderUtil.getContentLength(message, (long) defaultValue));
+    }
+
+    /**
      * Returns the content length of the specified web socket message.  If the
      * specified message is not a web socket message, {@code -1} is returned.
      */
@@ -192,7 +202,7 @@ public final class HttpHeaderUtil {
         if (value == null) {
             return false;
         }
-        if (HttpHeaderValues.CONTINUE.equalsIgnoreCase(value)) {
+        if (HttpHeaderValues.CONTINUE.contentEqualsIgnoreCase(value)) {
             return true;
         }
 
@@ -237,7 +247,7 @@ public final class HttpHeaderUtil {
             Iterator<CharSequence> valuesIt = values.iterator();
             while (valuesIt.hasNext()) {
                 CharSequence value = valuesIt.next();
-                if (HttpHeaderValues.CHUNKED.equalsIgnoreCase(value)) {
+                if (HttpHeaderValues.CHUNKED.contentEqualsIgnoreCase(value)) {
                     valuesIt.remove();
                 }
             }

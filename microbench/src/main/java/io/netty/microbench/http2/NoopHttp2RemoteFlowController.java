@@ -23,6 +23,7 @@ import io.netty.handler.codec.http2.Http2Stream;
 
 public final class NoopHttp2RemoteFlowController implements Http2RemoteFlowController {
     public static final NoopHttp2RemoteFlowController INSTANCE = new NoopHttp2RemoteFlowController();
+    private ChannelHandlerContext ctx;
 
     private NoopHttp2RemoteFlowController() { }
 
@@ -41,20 +42,46 @@ public final class NoopHttp2RemoteFlowController implements Http2RemoteFlowContr
     }
 
     @Override
+    public boolean isWritable(Http2Stream stream) {
+        return true;
+    }
+
+    @Override
     public int initialWindowSize(Http2Stream stream) {
         return MAX_INITIAL_WINDOW_SIZE;
     }
 
     @Override
-    public void incrementWindowSize(ChannelHandlerContext ctx, Http2Stream stream, int delta)
-            throws Http2Exception {
+    public void incrementWindowSize(Http2Stream stream, int delta) throws Http2Exception {
     }
 
     @Override
-    public void sendFlowControlled(ChannelHandlerContext ctx, Http2Stream stream, FlowControlled payload) {
+    public void writePendingBytes() throws Http2Exception {
+    }
+
+    @Override
+    public void listener(Listener listener) {
+    }
+
+    @Override
+    public void addFlowControlled(Http2Stream stream, FlowControlled payload) {
         // Don't check size beforehand because Headers payload returns 0 all the time.
         do {
-            payload.write(MAX_INITIAL_WINDOW_SIZE);
+            payload.write(ctx, MAX_INITIAL_WINDOW_SIZE);
         } while (payload.size() > 0);
+    }
+
+    @Override
+    public void channelHandlerContext(ChannelHandlerContext ctx) throws Http2Exception {
+        this.ctx = ctx;
+    }
+
+    @Override
+    public ChannelHandlerContext channelHandlerContext() {
+        return ctx;
+    }
+
+    @Override
+    public void channelWritabilityChanged() throws Http2Exception {
     }
 }

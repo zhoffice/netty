@@ -15,265 +15,65 @@
  */
 package io.netty.handler.codec.http;
 
-import io.netty.handler.codec.DefaultTextHeaders;
-import io.netty.handler.codec.TextHeaders;
+import io.netty.handler.codec.CharSequenceValueConverter;
+import io.netty.handler.codec.DefaultHeaders;
+import io.netty.handler.codec.Headers;
+import io.netty.handler.codec.HeadersUtils;
+import io.netty.handler.codec.ValueConverter;
 import io.netty.util.AsciiString;
 import io.netty.util.ByteProcessor;
 import io.netty.util.internal.PlatformDependent;
 
 import java.util.Calendar;
 import java.util.Date;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map.Entry;
 
-public class DefaultHttpHeaders extends DefaultTextHeaders implements HttpHeaders {
+import static io.netty.util.AsciiString.CASE_INSENSITIVE_HASHER;
+import static io.netty.util.AsciiString.CASE_SENSITIVE_HASHER;
+import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
-    private static final int HIGHEST_INVALID_NAME_CHAR_MASK = ~63;
+public class DefaultHttpHeaders extends DefaultHeaders<CharSequence> implements HttpHeaders {
     private static final int HIGHEST_INVALID_VALUE_CHAR_MASK = ~15;
-
-    /**
-     * A look-up table used for checking if a character in a header name is prohibited.
-     */
-    private static final byte[] LOOKUP_TABLE = new byte[~HIGHEST_INVALID_NAME_CHAR_MASK + 1];
-
-    static {
-        LOOKUP_TABLE['\t'] = -1;
-        LOOKUP_TABLE['\n'] = -1;
-        LOOKUP_TABLE[0x0b] = -1;
-        LOOKUP_TABLE['\f'] = -1;
-        LOOKUP_TABLE[' '] = -1;
-        LOOKUP_TABLE[','] = -1;
-        LOOKUP_TABLE[':'] = -1;
-        LOOKUP_TABLE[';'] = -1;
-        LOOKUP_TABLE['='] = -1;
-    }
-
-    private static final class HttpHeadersValidationConverter extends DefaultTextValueTypeConverter {
-        private final boolean validate;
-
-        HttpHeadersValidationConverter(boolean validate) {
-            this.validate = validate;
-        }
-
+    private static final ByteProcessor HEADER_NAME_VALIDATOR = new ByteProcessor() {
         @Override
-        public CharSequence convertObject(Object value) {
-            if (value == null) {
-                throw new NullPointerException("value");
-            }
-
-            CharSequence seq;
-            if (value instanceof CharSequence) {
-                seq = (CharSequence) value;
-            } else if (value instanceof Number) {
-                seq = value.toString();
-            } else if (value instanceof Date) {
-                seq = HttpHeaderDateFormat.get().format((Date) value);
-            } else if (value instanceof Calendar) {
-                seq = HttpHeaderDateFormat.get().format(((Calendar) value).getTime());
+        public boolean process(byte value) throws Exception {
+            validateChar((char) (value & 0xFF));
+            return true;
+        }
+    };
+    static final NameValidator<CharSequence> HttpNameValidator = new NameValidator<CharSequence>() {
+        @Override
+        public void validateName(CharSequence name) {
+            if (name instanceof AsciiString) {
+                try {
+                    ((AsciiString) name).forEachByte(HEADER_NAME_VALIDATOR);
+                } catch (Exception e) {
+                    PlatformDependent.throwException(e);
+                }
             } else {
-                seq = value.toString();
-            }
-
-            if (validate) {
-                if (value instanceof AsciiString) {
-                    validateValue((AsciiString) seq);
-                } else {
-                    validateValue(seq);
+                checkNotNull(name, "name");
+                // Go through each character in the name
+                for (int index = 0; index < name.length(); ++index) {
+                    validateChar(name.charAt(index));
                 }
             }
-
-            return seq;
         }
-
-        private static final class ValidateValueProcessor implements ByteProcessor {
-            private final CharSequence seq;
-            private int state;
-
-            public ValidateValueProcessor(CharSequence seq) {
-                this.seq = seq;
-            }
-
-            @Override
-            public boolean process(byte value) throws Exception {
-                state = validateValueChar(state, (char) value, seq);
-                return true;
-            }
-
-            public int state() {
-                return state;
-            }
-        }
-
-        private static void validateValue(AsciiString seq) {
-            ValidateValueProcessor processor = new ValidateValueProcessor(seq);
-            try {
-                seq.forEachByte(processor);
-            } catch (Throwable t) {
-                PlatformDependent.throwException(t);
-            }
-
-            if (processor.state() != 0) {
-                throw new IllegalArgumentException("a header value must not end with '\\r' or '\\n':" + seq);
-            }
-        }
-
-        private static void validateValue(CharSequence seq) {
-            int state = 0;
-            // Start looping through each of the character
-            for (int index = 0; index < seq.length(); index++) {
-                state = validateValueChar(state, seq.charAt(index), seq);
-            }
-
-            if (state != 0) {
-                throw new IllegalArgumentException("a header value must not end with '\\r' or '\\n':" + seq);
-            }
-        }
-
-        private static int validateValueChar(int state, char c, CharSequence seq) {
-            /*
-             * State:
-             * 0: Previous character was neither CR nor LF
-             * 1: The previous character was CR
-             * 2: The previous character was LF
-             */
-            if ((c & HIGHEST_INVALID_VALUE_CHAR_MASK) == 0) {
-                // Check the absolutely prohibited characters.
-                switch (c) {
-                case 0x0: // NULL
-                    throw new IllegalArgumentException("a header value contains a prohibited character '\0': " + seq);
-                case 0x0b: // Vertical tab
-                    throw new IllegalArgumentException("a header value contains a prohibited character '\\v': " + seq);
-                case '\f':
-                    throw new IllegalArgumentException("a header value contains a prohibited character '\\f': " + seq);
-                }
-            }
-
-            // Check the CRLF (HT | SP) pattern
-            switch (state) {
-            case 0:
-                switch (c) {
-                case '\r':
-                    state = 1;
-                    break;
-                case '\n':
-                    state = 2;
-                    break;
-                }
-                break;
-            case 1:
-                switch (c) {
-                case '\n':
-                    state = 2;
-                    break;
-                default:
-                    throw new IllegalArgumentException("only '\\n' is allowed after '\\r': " + seq);
-                }
-                break;
-            case 2:
-                switch (c) {
-                case '\t':
-                case ' ':
-                    state = 0;
-                    break;
-                default:
-                    throw new IllegalArgumentException("only ' ' and '\\t' are allowed after '\\n': " + seq);
-                }
-            }
-            return state;
-        }
-    }
-
-    static class HttpHeadersNameConverter implements NameConverter<CharSequence> {
-        protected final boolean validate;
-
-        private static final class ValidateNameProcessor implements ByteProcessor {
-            private final CharSequence seq;
-
-            public ValidateNameProcessor(CharSequence seq) {
-                this.seq = seq;
-            }
-
-            @Override
-            public boolean process(byte value) throws Exception {
-                // Check to see if the character is not an ASCII character.
-                if (value < 0) {
-                    throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " + seq);
-                }
-                validateNameChar(value, seq);
-                return true;
-            }
-        }
-
-        HttpHeadersNameConverter(boolean validate) {
-            this.validate = validate;
-        }
-
-        @Override
-        public CharSequence convertName(CharSequence name) {
-            if (validate) {
-                if (name instanceof AsciiString) {
-                    validateName((AsciiString) name);
-                } else {
-                    validateName(name);
-                }
-            }
-
-            return name;
-        }
-
-        private static void validateName(AsciiString name) {
-            try {
-                name.forEachByte(new ValidateNameProcessor(name));
-            } catch (Throwable t) {
-                PlatformDependent.throwException(t);
-            }
-        }
-
-        private static void validateName(CharSequence name) {
-            // Go through each characters in the name.
-            for (int index = 0; index < name.length(); index++) {
-                char c = name.charAt(index);
-
-                // Check to see if the character is not an ASCII character.
-                if (c > 127) {
-                    throw new IllegalArgumentException("a header name cannot contain non-ASCII characters: " + name);
-                }
-
-                // Check for prohibited characters.
-                validateNameChar(c, name);
-            }
-        }
-
-        private static void validateNameChar(int character, CharSequence seq) {
-            if ((character & HIGHEST_INVALID_NAME_CHAR_MASK) == 0 && LOOKUP_TABLE[character] != 0) {
-                throw new IllegalArgumentException(
-                        "a header name cannot contain the following prohibited characters: =,;: \\t\\r\\n\\v\\f: " +
-                                seq);
-            }
-        }
-    }
-
-    private static final HttpHeadersValidationConverter
-        VALIDATE_OBJECT_CONVERTER = new HttpHeadersValidationConverter(true);
-    private static final HttpHeadersValidationConverter
-        NO_VALIDATE_OBJECT_CONVERTER = new HttpHeadersValidationConverter(false);
-    private static final HttpHeadersNameConverter VALIDATE_NAME_CONVERTER = new HttpHeadersNameConverter(true);
-    private static final HttpHeadersNameConverter NO_VALIDATE_NAME_CONVERTER = new HttpHeadersNameConverter(false);
+    };
 
     public DefaultHttpHeaders() {
         this(true);
     }
 
+    @SuppressWarnings("unchecked")
     public DefaultHttpHeaders(boolean validate) {
-        this(true, validate? VALIDATE_NAME_CONVERTER : NO_VALIDATE_NAME_CONVERTER, false);
+        super(CASE_INSENSITIVE_HASHER, valueConverter(validate),
+                validate ? HttpNameValidator : NameValidator.NOT_NULL);
     }
 
-    protected DefaultHttpHeaders(boolean validate, boolean singleHeaderFields) {
-        this(true, validate? VALIDATE_NAME_CONVERTER : NO_VALIDATE_NAME_CONVERTER, singleHeaderFields);
-    }
-
-    protected DefaultHttpHeaders(boolean validate, NameConverter<CharSequence> nameConverter,
-                                 boolean singleHeaderFields) {
-        super(true, validate ? VALIDATE_OBJECT_CONVERTER : NO_VALIDATE_OBJECT_CONVERTER, nameConverter,
-                singleHeaderFields);
+    protected DefaultHttpHeaders(boolean validateValue, NameValidator<CharSequence> nameValidator) {
+        super(CASE_INSENSITIVE_HASHER, valueConverter(validateValue), nameValidator);
     }
 
     @Override
@@ -367,7 +167,7 @@ public class DefaultHttpHeaders extends DefaultTextHeaders implements HttpHeader
     }
 
     @Override
-    public HttpHeaders add(TextHeaders headers) {
+    public HttpHeaders add(Headers<? extends CharSequence> headers) {
         super.add(headers);
         return this;
     }
@@ -463,13 +263,13 @@ public class DefaultHttpHeaders extends DefaultTextHeaders implements HttpHeader
     }
 
     @Override
-    public HttpHeaders set(TextHeaders headers) {
+    public HttpHeaders set(Headers<? extends CharSequence> headers) {
         super.set(headers);
         return this;
     }
 
     @Override
-    public HttpHeaders setAll(TextHeaders headers) {
+    public HttpHeaders setAll(Headers<? extends CharSequence> headers) {
         super.setAll(headers);
         return this;
     }
@@ -478,5 +278,161 @@ public class DefaultHttpHeaders extends DefaultTextHeaders implements HttpHeader
     public HttpHeaders clear() {
         super.clear();
         return this;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (!(o instanceof HttpHeaders)) {
+            return false;
+        }
+        return equals((HttpHeaders) o, CASE_SENSITIVE_HASHER);
+    }
+
+    @Override
+    public int hashCode() {
+        return hashCode(CASE_SENSITIVE_HASHER);
+    }
+
+    @Override
+    public String getAsString(CharSequence name) {
+        return HeadersUtils.getAsString(this, name);
+    }
+
+    @Override
+    public List<String> getAllAsString(CharSequence name) {
+        return HeadersUtils.getAllAsString(this, name);
+    }
+
+    @Override
+    public Iterator<Entry<String, String>> iteratorAsString() {
+        return HeadersUtils.iteratorAsString(this);
+    }
+
+    @Override
+    public boolean contains(CharSequence name, CharSequence value) {
+        return contains(name, value, false);
+    }
+
+    @Override
+    public boolean contains(CharSequence name, CharSequence value, boolean ignoreCase) {
+        return contains(name, value,
+                ignoreCase ? CASE_INSENSITIVE_HASHER : CASE_SENSITIVE_HASHER);
+    }
+
+    private static void validateChar(char character) {
+        switch (character) {
+        case '\t':
+        case '\n':
+        case 0x0b:
+        case '\f':
+        case '\r':
+        case ' ':
+        case ',':
+        case ':':
+        case ';':
+        case '=':
+            throw new IllegalArgumentException(
+               "a header name cannot contain the following prohibited characters: =,;: \\t\\r\\n\\v\\f: " +
+                       character);
+        default:
+            // Check to see if the character is not an ASCII character, or invalid
+            if (character > 127) {
+                throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " +
+                        character);
+            }
+        }
+    }
+
+    private static ValueConverter<CharSequence> valueConverter(boolean validate) {
+        return validate ? HeaderValueConverterAndValidator.INSTANCE : HeaderValueConverter.INSTANCE;
+    }
+
+    private static class HeaderValueConverter extends CharSequenceValueConverter {
+        static final HeaderValueConverter INSTANCE = new HeaderValueConverter();
+
+        @Override
+        public CharSequence convertObject(Object value) {
+            checkNotNull(value, "value");
+            if (value instanceof CharSequence) {
+                return (CharSequence) value;
+            }
+            if (value instanceof Number) {
+                return value.toString();
+            }
+            if (value instanceof Date) {
+                return HttpHeaderDateFormat.get().format((Date) value);
+            }
+            if (value instanceof Calendar) {
+                return HttpHeaderDateFormat.get().format(((Calendar) value).getTime());
+            }
+            return value.toString();
+        }
+    }
+
+    private static final class HeaderValueConverterAndValidator extends HeaderValueConverter {
+        static final HeaderValueConverterAndValidator INSTANCE = new HeaderValueConverterAndValidator();
+
+        @Override
+        public CharSequence convertObject(Object value) {
+            CharSequence seq = super.convertObject(value);
+            int state = 0;
+            // Start looping through each of the character
+            for (int index = 0; index < seq.length(); index++) {
+                state = validateValueChar(seq, state, seq.charAt(index));
+            }
+
+            if (state != 0) {
+                throw new IllegalArgumentException("a header value must not end with '\\r' or '\\n':" + seq);
+            }
+            return seq;
+        }
+
+        private static int validateValueChar(CharSequence seq, int state, char character) {
+            /*
+             * State:
+             * 0: Previous character was neither CR nor LF
+             * 1: The previous character was CR
+             * 2: The previous character was LF
+             */
+            if ((character & HIGHEST_INVALID_VALUE_CHAR_MASK) == 0) {
+                // Check the absolutely prohibited characters.
+                switch (character) {
+                case 0x0: // NULL
+                    throw new IllegalArgumentException("a header value contains a prohibited character '\0': " + seq);
+                case 0x0b: // Vertical tab
+                    throw new IllegalArgumentException("a header value contains a prohibited character '\\v': " + seq);
+                case '\f':
+                    throw new IllegalArgumentException("a header value contains a prohibited character '\\f': " + seq);
+                }
+            }
+
+            // Check the CRLF (HT | SP) pattern
+            switch (state) {
+                case 0:
+                    switch (character) {
+                        case '\r':
+                            return 1;
+                        case '\n':
+                            return 2;
+                    }
+                    break;
+                case 1:
+                    switch (character) {
+                        case '\n':
+                            return 2;
+                        default:
+                            throw new IllegalArgumentException("only '\\n' is allowed after '\\r': " + seq);
+                    }
+                case 2:
+                    switch (character) {
+                        case '\t':
+                        case ' ':
+                            return 0;
+                        default:
+                            throw new IllegalArgumentException("only ' ' and '\\t' are allowed after '\\n': " + seq);
+                    }
+            }
+            return state;
+        }
     }
 }

@@ -19,6 +19,7 @@ import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.lang.Thread.State;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -26,7 +27,6 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
@@ -55,9 +55,16 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
             // Do nothing.
         }
     };
+    private static final Runnable NOOP_TASK = new Runnable() {
+        @Override
+        public void run() {
+            // Do nothing.
+        }
+    };
 
     private static final AtomicIntegerFieldUpdater<SingleThreadEventExecutor> STATE_UPDATER;
     private static final AtomicReferenceFieldUpdater<SingleThreadEventExecutor, Thread> THREAD_UPDATER;
+    private static final AtomicReferenceFieldUpdater<SingleThreadEventExecutor, ThreadProperties> PROPERTIES_UPDATER;
 
     static {
         AtomicIntegerFieldUpdater<SingleThreadEventExecutor> updater =
@@ -74,12 +81,20 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                     SingleThreadEventExecutor.class, Thread.class, "thread");
         }
         THREAD_UPDATER = refUpdater;
+        AtomicReferenceFieldUpdater<SingleThreadEventExecutor, ThreadProperties> propertiesUpdater =
+                PlatformDependent.newAtomicReferenceFieldUpdater(SingleThreadEventExecutor.class, "threadProperties");
+        if (propertiesUpdater == null) {
+            propertiesUpdater = AtomicReferenceFieldUpdater.newUpdater(SingleThreadEventExecutor.class,
+                                                                   ThreadProperties.class, "threadProperties");
+        }
+        PROPERTIES_UPDATER = propertiesUpdater;
     }
 
     private final Queue<Runnable> taskQueue;
 
     @SuppressWarnings({ "FieldMayBeFinal", "unused" })
     private volatile Thread thread;
+    private volatile ThreadProperties threadProperties;
     private final Executor executor;
     private final Semaphore threadLock = new Semaphore(0);
     private final Set<Runnable> shutdownHooks = new LinkedHashSet<Runnable>();
@@ -669,6 +684,31 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         }
     }
 
+    /**
+     * Returns the {@link ThreadProperties} of the {@link Thread} that powers the {@link SingleThreadEventExecutor}.
+     * If the {@link SingleThreadEventExecutor} is not started yet, this operation will start it and block until the
+     * it is fully started.
+     */
+    public final ThreadProperties threadProperties() {
+        ThreadProperties threadProperties = this.threadProperties;
+        if (threadProperties == null) {
+            Thread thread = this.thread;
+            if (thread == null) {
+                assert !inEventLoop();
+                submit(NOOP_TASK).syncUninterruptibly();
+                thread = this.thread;
+                assert thread != null;
+            }
+
+            threadProperties = new DefaultThreadProperties(thread);
+            if (!PROPERTIES_UPDATER.compareAndSet(this, null, threadProperties)) {
+                threadProperties = this.threadProperties;
+            }
+        }
+
+        return threadProperties;
+    }
+
     @SuppressWarnings("unused")
     protected boolean wakesUpForTask(Runnable task) {
         return true;
@@ -726,9 +766,6 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     private void startExecution() {
         if (STATE_UPDATER.get(this) == ST_NOT_STARTED) {
             if (STATE_UPDATER.compareAndSet(this, ST_NOT_STARTED, ST_STARTED)) {
-                schedule(new ScheduledFutureTask<Void>(
-                        this, Executors.<Void>callable(new PurgeTask(), null),
-                        ScheduledFutureTask.deadlineNanos(SCHEDULE_PURGE_INTERVAL), -SCHEDULE_PURGE_INTERVAL));
                 scheduleExecution();
             }
         }
@@ -743,10 +780,51 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         THREAD_UPDATER.lazySet(this, t);
     }
 
-    private final class PurgeTask implements Runnable {
+    private static final class DefaultThreadProperties implements ThreadProperties {
+        private final Thread t;
+
+        DefaultThreadProperties(Thread t) {
+            this.t = t;
+        }
+
         @Override
-        public void run() {
-            purgeCancelledScheduledTasks();
+        public State state() {
+            return t.getState();
+        }
+
+        @Override
+        public int priority() {
+            return t.getPriority();
+        }
+
+        @Override
+        public boolean isInterrupted() {
+            return t.isInterrupted();
+        }
+
+        @Override
+        public boolean isDaemon() {
+            return t.isDaemon();
+        }
+
+        @Override
+        public String name() {
+            return t.getName();
+        }
+
+        @Override
+        public long id() {
+            return t.getId();
+        }
+
+        @Override
+        public StackTraceElement[] stackTrace() {
+            return t.getStackTrace();
+        }
+
+        @Override
+        public boolean isAlive() {
+            return t.isAlive();
         }
     }
 }

@@ -19,6 +19,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPipeline;
+import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.TooLongFrameException;
@@ -239,6 +240,12 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 out.add(message);
                 return;
             default:
+                /**
+                 * <a href="https://tools.ietf.org/html/rfc7230#section-3.3.3">RFC 7230, 3.3.3</a> states that if a
+                 * request does not have either a transfer-encoding or a content-length header then the message body
+                 * length is 0. However for a response the body length is the number of octets received prior to the
+                 * server closing the connection. So we treat this as variable length chunked encoding.
+                 */
                 long contentLength = contentLength();
                 if (contentLength == 0 || contentLength == -1 && isDecodingRequest()) {
                     out.add(message);
@@ -391,7 +398,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
 
         // Handle the last unfinished message.
         if (message != null) {
-            boolean chunked = HttpHeaderUtil.isTransferEncodingChunked(message);
+            boolean chunked = HttpUtil.isTransferEncodingChunked(message);
             if (currentState == State.READ_VARIABLE_LENGTH_CONTENT && !in.isReadable() && !chunked) {
                 // End of connection.
                 out.add(LastHttpContent.EMPTY_LAST_CONTENT);
@@ -417,6 +424,27 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
     }
 
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+        if (evt instanceof ChannelInputShutdownEvent) {
+            // The decodeLast method is invoked when a channelInactive event is encountered.
+            // This method is responsible for ending requests in some situations and must be called
+            // when the input has been shutdown.
+            super.channelInactive(ctx);
+        } else if (evt instanceof HttpExpectationFailedEvent) {
+            switch (currentState) {
+            case READ_FIXED_LENGTH_CONTENT:
+            case READ_VARIABLE_LENGTH_CONTENT:
+            case READ_CHUNK_SIZE:
+                reset();
+                break;
+            default:
+                break;
+            }
+        }
+        super.userEventTriggered(ctx, evt);
+    }
+
     protected boolean isContentAlwaysEmpty(HttpMessage msg) {
         if (msg instanceof HttpResponse) {
             HttpResponse res = (HttpResponse) msg;
@@ -429,7 +457,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             //     - https://github.com/netty/netty/issues/222
             if (code >= 100 && code < 200) {
                 // One exception: Hixie 76 websocket handshake response
-                return !(code == 101 && !res.headers().contains(HttpHeaderNames.SEC_WEBSOCKET_ACCEPT));
+                return !(code == 101 && !res.headers().contains(HttpHeaderNames.SEC_WEBSOCKET_ACCEPT)
+                         && res.headers().contains(HttpHeaderNames.UPGRADE, HttpHeaderValues.WEBSOCKET, true));
             }
 
             switch (code) {
@@ -559,9 +588,9 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         State nextState;
 
         if (isContentAlwaysEmpty(message)) {
-            HttpHeaderUtil.setTransferEncodingChunked(message, false);
+            HttpUtil.setTransferEncodingChunked(message, false);
             nextState = State.SKIP_CONTROL_CHARS;
-        } else if (HttpHeaderUtil.isTransferEncodingChunked(message)) {
+        } else if (HttpUtil.isTransferEncodingChunked(message)) {
             nextState = State.READ_CHUNK_SIZE;
         } else if (contentLength() >= 0) {
             nextState = State.READ_FIXED_LENGTH_CONTENT;
@@ -573,7 +602,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
 
     private long contentLength() {
         if (contentLength == Long.MIN_VALUE) {
-            contentLength = HttpHeaderUtil.getContentLength(message, -1);
+            contentLength = HttpUtil.getContentLength(message, -1);
         }
         return contentLength;
     }
@@ -607,9 +636,9 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 } else {
                     splitHeader(line);
                     CharSequence headerName = name;
-                    if (!HttpHeaderNames.CONTENT_LENGTH.equalsIgnoreCase(headerName) &&
-                        !HttpHeaderNames.TRANSFER_ENCODING.equalsIgnoreCase(headerName) &&
-                        !HttpHeaderNames.TRAILER.equalsIgnoreCase(headerName)) {
+                    if (!HttpHeaderNames.CONTENT_LENGTH.contentEqualsIgnoreCase(headerName) &&
+                        !HttpHeaderNames.TRANSFER_ENCODING.contentEqualsIgnoreCase(headerName) &&
+                        !HttpHeaderNames.TRAILER.contentEqualsIgnoreCase(headerName)) {
                         trailer.trailingHeaders().add(headerName, value);
                     }
                     lastHeader = name;
@@ -666,9 +695,9 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         cEnd = findEndOfString(sb);
 
         return new String[] {
-                sb.substring(aStart, aEnd),
-                sb.substring(bStart, bEnd),
-                cStart < cEnd? sb.substring(cStart, cEnd) : "" };
+                sb.subStringUnsafe(aStart, aEnd),
+                sb.subStringUnsafe(bStart, bEnd),
+                cStart < cEnd? sb.subStringUnsafe(cStart, cEnd) : "" };
     }
 
     private void splitHeader(AppendableCharSequence sb) {
@@ -694,44 +723,41 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             }
         }
 
-        name = sb.substring(nameStart, nameEnd);
+        name = sb.subStringUnsafe(nameStart, nameEnd);
         valueStart = findNonWhitespace(sb, colonEnd);
         if (valueStart == length) {
             value = EMPTY_VALUE;
         } else {
             valueEnd = findEndOfString(sb);
-            value = sb.substring(valueStart, valueEnd);
+            value = sb.subStringUnsafe(valueStart, valueEnd);
         }
     }
 
-    private static int findNonWhitespace(CharSequence sb, int offset) {
-        int result;
-        for (result = offset; result < sb.length(); result ++) {
-            if (!Character.isWhitespace(sb.charAt(result))) {
-                break;
+    private static int findNonWhitespace(AppendableCharSequence sb, int offset) {
+        for (int result = offset; result < sb.length(); ++result) {
+            if (!Character.isWhitespace(sb.charAtUnsafe(result))) {
+                return result;
             }
         }
-        return result;
+        return sb.length();
     }
 
-    private static int findWhitespace(CharSequence sb, int offset) {
-        int result;
-        for (result = offset; result < sb.length(); result ++) {
-            if (Character.isWhitespace(sb.charAt(result))) {
-                break;
+    private static int findWhitespace(AppendableCharSequence sb, int offset) {
+        for (int result = offset; result < sb.length(); ++result) {
+            if (Character.isWhitespace(sb.charAtUnsafe(result))) {
+                return result;
             }
         }
-        return result;
+        return sb.length();
     }
 
-    private static int findEndOfString(CharSequence sb) {
-        int result;
-        for (result = sb.length(); result > 0; result --) {
-            if (!Character.isWhitespace(sb.charAt(result - 1))) {
-                break;
+    private static int findEndOfString(AppendableCharSequence sb) {
+        for (int result = sb.length() - 1; result > 0; --result) {
+            if (!Character.isWhitespace(sb.charAtUnsafe(result))) {
+                return result + 1;
             }
         }
-        return result;
+        return 0;
     }
 
     private static class HeaderParser implements ByteProcessor {

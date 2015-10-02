@@ -14,17 +14,6 @@
  */
 package io.netty.handler.codec.http2;
 
-import static io.netty.handler.codec.http2.Http2CodecUtil.HTTP_UPGRADE_STREAM_ID;
-import static io.netty.handler.codec.http2.Http2CodecUtil.connectionPrefaceBuf;
-import static io.netty.handler.codec.http2.Http2CodecUtil.getEmbeddedHttp2Exception;
-import static io.netty.handler.codec.http2.Http2Error.INTERNAL_ERROR;
-import static io.netty.handler.codec.http2.Http2Error.NO_ERROR;
-import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
-import static io.netty.handler.codec.http2.Http2Exception.connectionError;
-import static io.netty.handler.codec.http2.Http2Exception.isStreamError;
-import static io.netty.util.CharsetUtil.UTF_8;
-import static io.netty.util.internal.ObjectUtil.checkNotNull;
-import static java.lang.String.format;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.ChannelFuture;
@@ -34,10 +23,31 @@ import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.http2.Http2Exception.CompositeStreamException;
 import io.netty.handler.codec.http2.Http2Exception.StreamException;
+import io.netty.util.concurrent.ScheduledFuture;
+import io.netty.util.internal.OneTimeTask;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import static io.netty.buffer.ByteBufUtil.hexDump;
+import static io.netty.handler.codec.http2.Http2CodecUtil.HTTP_UPGRADE_STREAM_ID;
+import static io.netty.handler.codec.http2.Http2CodecUtil.SMALLEST_MAX_CONCURRENT_STREAMS;
+import static io.netty.handler.codec.http2.Http2CodecUtil.connectionPrefaceBuf;
+import static io.netty.handler.codec.http2.Http2CodecUtil.getEmbeddedHttp2Exception;
+import static io.netty.handler.codec.http2.Http2Error.INTERNAL_ERROR;
+import static io.netty.handler.codec.http2.Http2Error.NO_ERROR;
+import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
+import static io.netty.handler.codec.http2.Http2Exception.connectionError;
+import static io.netty.handler.codec.http2.Http2Exception.isStreamError;
+import static io.netty.handler.codec.http2.Http2FrameTypes.SETTINGS;
+import static io.netty.util.CharsetUtil.UTF_8;
+import static io.netty.util.internal.ObjectUtil.checkNotNull;
+import static java.lang.Math.min;
+import static java.lang.String.format;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 
 /**
  * Provides the default implementation for processing inbound frame events and delegates to a
@@ -50,34 +60,198 @@ import java.util.List;
  */
 public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http2LifecycleManager {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(Http2ConnectionHandler.class);
+    private static final long DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MILLIS = MILLISECONDS.convert(30, SECONDS);
+
     private final Http2ConnectionDecoder decoder;
     private final Http2ConnectionEncoder encoder;
     private final Http2Settings initialSettings;
     private ChannelFutureListener closeListener;
     private BaseDecoder byteDecoder;
+    private long gracefulShutdownTimeoutMillis;
 
-    public Http2ConnectionHandler(boolean server, Http2FrameListener listener) {
-        this(new DefaultHttp2Connection(server), listener);
-    }
-
-    public Http2ConnectionHandler(Http2Connection connection, Http2FrameListener listener) {
-        this(connection, new DefaultHttp2FrameReader(), new DefaultHttp2FrameWriter(), listener);
-    }
-
-    public Http2ConnectionHandler(Http2Connection connection, Http2FrameReader frameReader,
-                                  Http2FrameWriter frameWriter, Http2FrameListener listener) {
-        initialSettings = null;
-        encoder = new DefaultHttp2ConnectionEncoder(connection, frameWriter);
-        decoder = new DefaultHttp2ConnectionDecoder(connection, encoder, frameReader, listener);
+    /**
+     * Builder which builds {@link Http2ConnectionHandler} objects.
+     */
+    public static final class Builder extends BuilderBase<Http2ConnectionHandler, Builder> {
+        @Override
+        public Http2ConnectionHandler build0(Http2ConnectionDecoder decoder,
+                                             Http2ConnectionEncoder encoder) {
+            return new Http2ConnectionHandler(decoder, encoder, initialSettings());
+        }
     }
 
     /**
-     * Constructor for pre-configured encoder and decoder. Just sets the {@code this} as the
-     * {@link Http2LifecycleManager} and builds them.
+     * Base class for a {@code builder} of any subclass of {@link Http2ConnectionHandler}.
+     * @param <T> The type of handler created by this builder.
+     * @param <B> The concrete type for this builder.
      */
-    public Http2ConnectionHandler(Http2ConnectionDecoder decoder,
-                                  Http2ConnectionEncoder encoder) {
-        this.initialSettings = null;
+    public abstract static class BuilderBase<T extends Http2ConnectionHandler, B extends BuilderBase<T, B>> {
+        private Http2Settings initialSettings = new Http2Settings();
+        private Http2FrameListener frameListener;
+        private Http2FrameLogger frameLogger;
+        private boolean validateHeaders = true;
+        private boolean server = true;
+        private int encoderMaxConcurrentStreams = SMALLEST_MAX_CONCURRENT_STREAMS;
+        private long gracefulShutdownTimeoutMillis = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_MILLIS;
+
+        /**
+         * Sets the listener for inbound frames.
+         * This listener will only be set if the decoder's listener is {@code null}.
+         */
+        public B frameListener(Http2FrameListener listener) {
+            frameListener = listener;
+            return thisB();
+        }
+
+        /**
+         * Determine if HTTP headers should be validated according to
+         * <a href="https://tools.ietf.org/html/rfc7540#section-8.1.2.6">RFC 7540, 8.1.2.6</a>.
+         */
+        public B validateHeaders(boolean validate) {
+            validateHeaders = validate;
+            return thisB();
+        }
+
+        /**
+         * Get if HTTP headers should be validated according to
+         * <a href="https://tools.ietf.org/html/rfc7540#section-8.1.2.6">RFC 7540, 8.1.2.6</a>.
+         */
+        public final boolean isValidateHeaders() {
+            return validateHeaders;
+        }
+
+        /**
+         * Settings to use for the initial connection settings exchange.
+         */
+        public B initialSettings(Http2Settings settings) {
+            initialSettings = settings;
+            return thisB();
+        }
+
+        /**
+         * Get the settings to use for the initial connection settings exchange.
+         */
+        public final Http2Settings initialSettings() {
+            return initialSettings;
+        }
+
+        /**
+         * Determines if {@link #build()} will to create a {@link Http2Connection} in server mode ({@code true})
+         * or client mode ({@code false}).
+         */
+        public B server(boolean isServer) {
+            server = isServer;
+            return thisB();
+        }
+
+        /**
+         * Set the logger that is used for the encoder and decoder.
+         */
+        public B frameLogger(Http2FrameLogger logger) {
+            frameLogger = logger;
+            return thisB();
+        }
+
+        public B gracefulShutdownTimeoutMillis(long gracefulShutdownTimeoutMillis) {
+            this.gracefulShutdownTimeoutMillis = gracefulShutdownTimeoutMillis;
+            return thisB();
+        }
+
+        /**
+         * Determine if the encoder should queue frames to honor the value set by
+         * {@link #encoderMaxConcurrentStreams(int)}.
+         */
+        public B encoderEnforceMaxConcurrentStreams(boolean encoderEnforceMaxConcurrentStreams) {
+            encoderMaxConcurrentStreams = -1;
+            return thisB();
+        }
+
+        private boolean encoderEnforceMaxConcurrentStreams() {
+            return encoderMaxConcurrentStreams >= 0;
+        }
+
+        /**
+         * How many initial streams are allowed to exists concurrently. Frames will be queued if they would result in
+         * creating a stream which would cause the number of existing streams to exceed this number.
+         * @see #encoderEnforceMaxConcurrentStreams(boolean)
+         */
+        public B encoderMaxConcurrentStreams(int encoderMaxConcurrentStreams) {
+            // This bounds are enforced here because the builder makes assumptions about its valid range to determine
+            // if it should be used.
+            if (encoderMaxConcurrentStreams < 0) {
+                throw new IllegalArgumentException("encoderMaxConcurrentStreams: " + encoderMaxConcurrentStreams +
+                        " (expected >= 0)");
+            }
+            this.encoderMaxConcurrentStreams = encoderMaxConcurrentStreams;
+            return thisB();
+        }
+
+        /**
+         * Create a new {@link Http2Connection} and build a new instance.
+         */
+        public final T build() {
+            return build(new DefaultHttp2Connection(server));
+        }
+
+        /**
+         * Build a new instance with an existing {@link Http2Connection}.
+         * <p>
+         * Methods that will be ignored due to objects already being created:
+         * <ul><li>{@link #server(boolean)}</li></ul>
+         */
+        public final T build(Http2Connection connection) {
+            Http2FrameReader reader = new DefaultHttp2FrameReader(validateHeaders);
+            Http2FrameWriter writer = new DefaultHttp2FrameWriter();
+            if (frameLogger != null) {
+                reader = new Http2InboundFrameLogger(reader, frameLogger);
+                writer = new Http2OutboundFrameLogger(writer, frameLogger);
+            }
+            Http2ConnectionEncoder encoder = new DefaultHttp2ConnectionEncoder(connection, writer);
+            if (encoderEnforceMaxConcurrentStreams()) {
+                encoder = new StreamBufferingEncoder(encoder, encoderMaxConcurrentStreams);
+            }
+            Http2ConnectionDecoder decoder = new DefaultHttp2ConnectionDecoder(connection, encoder, reader);
+            return build(decoder, encoder);
+        }
+
+        /**
+         * Build a new instance with an existing {@link Http2ConnectionDecoder} and {@link Http2ConnectionEncoder}.
+         * <p>
+         * Methods that will be ignored due to objects already being created:
+         * <ul><li>{@link #server(boolean)}</li><li>{@link #validateHttp2Headers(boolean)}</li><li>
+         * {@link #frameLogger(Http2FrameLogger)}</li><li>{@link #encoderEnforceMaxConcurrentStreams(boolean)}</li><li>
+         * {@link #encoderMaxConcurrentStreams(int)}</li></ul>
+         */
+        public final T build(Http2ConnectionDecoder decoder, Http2ConnectionEncoder encoder) {
+            // Call the abstract build method
+            T handler = build0(decoder, encoder);
+
+            // Setup post build options
+            handler.gracefulShutdownTimeoutMillis(gracefulShutdownTimeoutMillis);
+            if (handler.decoder().frameListener() == null) {
+                handler.decoder().frameListener(frameListener);
+            }
+            return handler;
+        }
+
+        /**
+         * Sub classes should override this to instantiate the concrete type.
+         * <p>
+         * The return of this method will be subject to the following:
+         * <ul><li>{@link #frameListener(Http2FrameListener)} will be set if not already set in the decoder</li><li>
+         * {@link #gracefulShutdownTimeoutMillis(long)} will be set</li></ul>
+         */
+        protected abstract T build0(Http2ConnectionDecoder decoder, Http2ConnectionEncoder encoder);
+
+        @SuppressWarnings("unchecked")
+        protected B thisB() {
+            return (B) this;
+        }
+    }
+
+    protected Http2ConnectionHandler(Http2ConnectionDecoder decoder, Http2ConnectionEncoder encoder,
+                                     Http2Settings initialSettings) {
+        this.initialSettings = checkNotNull(initialSettings, "initialSettings");
         this.decoder = checkNotNull(decoder, "decoder");
         this.encoder = checkNotNull(encoder, "encoder");
         if (encoder.connection() != decoder.connection()) {
@@ -85,29 +259,26 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
         }
     }
 
-    public Http2ConnectionHandler(Http2Connection connection, Http2FrameListener listener,
-                                  Http2Settings initialSettings) {
-        this(connection, new DefaultHttp2FrameReader(), new DefaultHttp2FrameWriter(), listener,
-                initialSettings);
+    /**
+     * Get the amount of time (in milliseconds) this endpoint will wait for all streams to be closed before closing
+     * the connection during the graceful shutdown process.
+     */
+    public long gracefulShutdownTimeoutMillis() {
+        return gracefulShutdownTimeoutMillis;
     }
 
-    public Http2ConnectionHandler(Http2Connection connection, Http2FrameReader frameReader,
-                                  Http2FrameWriter frameWriter, Http2FrameListener listener,
-                                  Http2Settings initialSettings) {
-        this.initialSettings = initialSettings;
-        encoder = new DefaultHttp2ConnectionEncoder(connection, frameWriter);
-        decoder = new DefaultHttp2ConnectionDecoder(connection, encoder, frameReader, listener);
-    }
-
-    public Http2ConnectionHandler(Http2ConnectionDecoder decoder,
-                                  Http2ConnectionEncoder encoder,
-                                  Http2Settings initialSettings) {
-        this.initialSettings = initialSettings;
-        this.decoder = checkNotNull(decoder, "decoder");
-        this.encoder = checkNotNull(encoder, "encoder");
-        if (encoder.connection() != decoder.connection()) {
-            throw new IllegalArgumentException("Encoder and Decoder do not share the same connection object");
+    /**
+     * Set the amount of time (in milliseconds) this endpoint will wait for all streams to be closed before closing
+     * the connection during the graceful shutdown process.
+     * @param gracefulShutdownTimeoutMillis the amount of time (in milliseconds) this endpoint will wait for all
+     * streams to be closed before closing the connection during the graceful shutdown process.
+     */
+    public void gracefulShutdownTimeoutMillis(long gracefulShutdownTimeoutMillis) {
+        if (gracefulShutdownTimeoutMillis < 0) {
+            throw new IllegalArgumentException("gracefulShutdownTimeoutMillis: " + gracefulShutdownTimeoutMillis +
+                    " (expected: >= 0)");
         }
+        this.gracefulShutdownTimeoutMillis = gracefulShutdownTimeoutMillis;
     }
 
     public Http2Connection connection() {
@@ -161,31 +332,38 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
         connection().remote().createStream(HTTP_UPGRADE_STREAM_ID, true);
     }
 
+    @Override
+    public void flush(ChannelHandlerContext ctx) throws Http2Exception {
+        // Trigger pending writes in the remote flow controller.
+        encoder.flowController().writePendingBytes();
+        try {
+            super.flush(ctx);
+        } catch (Throwable t) {
+            throw new Http2Exception(INTERNAL_ERROR, "Error flushing" , t);
+        }
+    }
+
     private abstract class BaseDecoder {
         public abstract void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception;
         public void handlerRemoved(ChannelHandlerContext ctx) throws Exception { }
         public void channelActive(ChannelHandlerContext ctx) throws Exception { }
 
         public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-            try {
-                final Http2Connection connection = connection();
-                // Check if there are streams to avoid the overhead of creating the ChannelFuture.
-                if (connection.numActiveStreams() > 0) {
-                    final ChannelFuture future = ctx.newSucceededFuture();
-                    connection.forEachActiveStream(new Http2StreamVisitor() {
-                        @Override
-                        public boolean visit(Http2Stream stream) throws Http2Exception {
-                            closeStream(stream, future);
-                            return true;
-                        }
-                    });
-                }
-            } finally {
-                try {
-                    encoder().close();
-                } finally {
-                    decoder().close();
-                }
+            // Connection has terminated, close the encoder and decoder.
+            encoder().close();
+            decoder().close();
+
+            final Http2Connection connection = connection();
+            // Check if there are streams to avoid the overhead of creating the ChannelFuture.
+            if (connection.numActiveStreams() > 0) {
+                final ChannelFuture future = ctx.newSucceededFuture();
+                connection.forEachActiveStream(new Http2StreamVisitor() {
+                    @Override
+                    public boolean visit(Http2Stream stream) throws Http2Exception {
+                        closeStream(stream, future);
+                        return true;
+                    }
+                });
             }
         }
 
@@ -216,13 +394,13 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
         @Override
         public void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
             try {
-                if (readClientPrefaceString(in)) {
+                if (readClientPrefaceString(in) && verifyFirstFrameIsSettings(in)) {
                     // After the preface is read, it is time to hand over control to the post initialized decoder.
-                    Http2ConnectionHandler.this.byteDecoder = new FrameDecoder();
-                    Http2ConnectionHandler.this.byteDecoder.decode(ctx, in, out);
+                    byteDecoder = new FrameDecoder();
+                    byteDecoder.decode(ctx, in, out);
                 }
             } catch (Throwable e) {
-                onException(ctx, e);
+                onError(ctx, e);
             }
         }
 
@@ -268,12 +446,15 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
             }
 
             int prefaceRemaining = clientPrefaceString.readableBytes();
-            int bytesRead = Math.min(in.readableBytes(), prefaceRemaining);
+            int bytesRead = min(in.readableBytes(), prefaceRemaining);
 
             // If the input so far doesn't match the preface, break the connection.
             if (bytesRead == 0 || !ByteBufUtil.equals(in, in.readerIndex(),
                     clientPrefaceString, clientPrefaceString.readerIndex(), bytesRead)) {
-                throw connectionError(PROTOCOL_ERROR, "HTTP/2 client preface string missing or corrupt.");
+                String receivedBytes = hexDump(in, in.readerIndex(),
+                        min(in.readableBytes(), clientPrefaceString.readableBytes()));
+                throw connectionError(PROTOCOL_ERROR, "HTTP/2 client preface string missing or corrupt. " +
+                        "Hex dump for received bytes: %s", receivedBytes);
             }
             in.skipBytes(bytesRead);
             clientPrefaceString.skipBytes(bytesRead);
@@ -285,6 +466,28 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
                 return true;
             }
             return false;
+        }
+
+        /**
+         * Peeks at that the next frame in the buffer and verifies that it is a {@code SETTINGS} frame.
+         *
+         * @param in the inbound buffer.
+         * @return {@code} true if the next frame is a {@code SETTINGS} frame, {@code false} if more
+         * data is required before we can determine the next frame type.
+         * @throws Http2Exception thrown if the next frame is NOT a {@code SETTINGS} frame.
+         */
+        private boolean verifyFirstFrameIsSettings(ByteBuf in) throws Http2Exception {
+            if (in.readableBytes() < 4) {
+                // Need more data before we can see the frame type for the first frame.
+                return false;
+            }
+
+            byte frameType = in.getByte(in.readerIndex() + 3);
+            if (frameType != SETTINGS) {
+                throw connectionError(PROTOCOL_ERROR, "First received frame was not SETTINGS. " +
+                        "Hex dump for first 4 bytes: %s", hexDump(in, in.readerIndex(), 4));
+            }
+            return true;
         }
 
         /**
@@ -303,7 +506,7 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
             }
 
             // Both client and server must send their initial settings.
-            encoder.writeSettings(ctx, initialSettings(), ctx.newPromise()).addListener(
+            encoder.writeSettings(ctx, initialSettings, ctx.newPromise()).addListener(
                     ChannelFutureListener.CLOSE_ON_FAILURE);
         }
     }
@@ -314,16 +517,18 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
             try {
                 decoder.decodeFrame(ctx, in, out);
             } catch (Throwable e) {
-                onException(ctx, e);
+                onError(ctx, e);
             }
         }
     }
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
-        // Initialize the encoder and decoder.
+        // Initialize the encoder, decoder, flow controllers, and internal state.
         encoder.lifecycleManager(this);
         decoder.lifecycleManager(this);
+        encoder.flowController().channelHandlerContext(ctx);
+        decoder.flowController().channelHandlerContext(ctx);
         byteDecoder = new PrefaceDecoder(ctx);
     }
 
@@ -346,10 +551,25 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        // Call super class first, as this may result in decode being called.
+        super.channelInactive(ctx);
         if (byteDecoder != null) {
             byteDecoder.channelInactive(ctx);
-            super.channelInactive(ctx);
             byteDecoder = null;
+        }
+    }
+
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+        // Writability is expected to change while we are writing. We cannot allow this event to trigger reentering
+        // the allocation and write loop. Reentering the event loop will lead to over or illegal allocation.
+        try {
+            if (ctx.channel().isWritable()) {
+                flush(ctx);
+            }
+            encoder.flowController().channelWritabilityChanged();
+        } finally {
+            super.channelWritabilityChanged(ctx);
         }
     }
 
@@ -368,13 +588,17 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
 
         ChannelFuture future = goAway(ctx, null);
         ctx.flush();
+        doGracefulShutdown(ctx, future, promise);
+    }
 
+    private void doGracefulShutdown(ChannelHandlerContext ctx, ChannelFuture future, ChannelPromise promise) {
         // If there are no active streams, close immediately after the send is complete.
         // Otherwise wait until all streams are inactive.
         if (isGracefulShutdownComplete()) {
             future.addListener(new ClosingChannelFutureListener(ctx, promise));
         } else {
-            closeListener = new ClosingChannelFutureListener(ctx, promise);
+            closeListener = new ClosingChannelFutureListener(ctx, promise,
+                                        gracefulShutdownTimeoutMillis, MILLISECONDS);
         }
     }
 
@@ -382,7 +606,11 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
     public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
         // Trigger flush after read on the assumption that flush is cheap if there is nothing to write and that
         // for flow-control the read may release window that causes data to be written that can now be flushed.
-        ctx.flush();
+        try {
+            flush(ctx);
+        } finally {
+            super.channelReadComplete(ctx);
+        }
     }
 
     /**
@@ -392,7 +620,7 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
         if (getEmbeddedHttp2Exception(cause) != null) {
             // Some exception in the causality chain is an Http2Exception - handle it.
-            onException(ctx, cause);
+            onError(ctx, cause);
         } else {
             super.exceptionCaught(ctx, cause);
         }
@@ -458,7 +686,7 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
      * Central handler for all exceptions caught during HTTP/2 processing.
      */
     @Override
-    public void onException(ChannelHandlerContext ctx, Throwable cause) {
+    public void onError(ChannelHandlerContext ctx, Throwable cause) {
         Http2Exception embedded = getEmbeddedHttp2Exception(cause);
         if (isStreamError(embedded)) {
             onStreamError(ctx, cause, (StreamException) embedded);
@@ -495,7 +723,17 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
         if (http2Ex == null) {
             http2Ex = new Http2Exception(INTERNAL_ERROR, cause.getMessage(), cause);
         }
-        goAway(ctx, http2Ex).addListener(new ClosingChannelFutureListener(ctx, ctx.newPromise()));
+
+        ChannelPromise promise = ctx.newPromise();
+        ChannelFuture future = goAway(ctx, http2Ex);
+        switch (http2Ex.shutdownHint()) {
+        case GRACEFUL_SHUTDOWN:
+            doGracefulShutdown(ctx, future, promise);
+            break;
+        default:
+            future.addListener(new ClosingChannelFutureListener(ctx, promise));
+            break;
+        }
     }
 
     /**
@@ -601,13 +839,6 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
     }
 
     /**
-     * Gets the initial settings to be sent to the remote endpoint.
-     */
-    private Http2Settings initialSettings() {
-        return initialSettings != null ? initialSettings : decoder.localSettings();
-    }
-
-    /**
      * Close the remote endpoint with with a {@code GO_AWAY} frame. Does <strong>not</strong> flush
      * immediately, this is the responsibility of the caller.
      */
@@ -660,14 +891,31 @@ public class Http2ConnectionHandler extends ByteToMessageDecoder implements Http
     private static final class ClosingChannelFutureListener implements ChannelFutureListener {
         private final ChannelHandlerContext ctx;
         private final ChannelPromise promise;
+        private final ScheduledFuture<?> timeoutTask;
 
         ClosingChannelFutureListener(ChannelHandlerContext ctx, ChannelPromise promise) {
             this.ctx = ctx;
             this.promise = promise;
+            timeoutTask = null;
+        }
+
+        ClosingChannelFutureListener(final ChannelHandlerContext ctx, final ChannelPromise promise,
+                                     long timeout, TimeUnit unit) {
+            this.ctx = ctx;
+            this.promise = promise;
+            timeoutTask = ctx.executor().schedule(new OneTimeTask() {
+                @Override
+                public void run() {
+                    ctx.close(promise);
+                }
+            }, timeout, unit);
         }
 
         @Override
         public void operationComplete(ChannelFuture sentGoAwayFuture) throws Exception {
+            if (timeoutTask != null) {
+                timeoutTask.cancel(false);
+            }
             ctx.close(promise);
         }
     }

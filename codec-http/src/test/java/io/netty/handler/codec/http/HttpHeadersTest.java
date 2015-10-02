@@ -31,7 +31,7 @@ public class HttpHeadersTest {
         HttpMessage message = new DefaultHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
         message.headers().set(HttpHeaderNames.TRANSFER_ENCODING, "Chunked");
         assertFalse(message.headers().isEmpty());
-        HttpHeaderUtil.setTransferEncodingChunked(message, false);
+        HttpUtil.setTransferEncodingChunked(message, false);
         assertTrue(message.headers().isEmpty());
     }
 
@@ -51,11 +51,11 @@ public class HttpHeadersTest {
     }
 
     @Test
-    public void testEquansIgnoreCase() {
-        assertThat(AsciiString.equalsIgnoreCase(null, null), is(true));
-        assertThat(AsciiString.equalsIgnoreCase(null, "foo"), is(false));
-        assertThat(AsciiString.equalsIgnoreCase("bar", null), is(false));
-        assertThat(AsciiString.equalsIgnoreCase("FoO", "fOo"), is(true));
+    public void testEqualsIgnoreCase() {
+        assertThat(AsciiString.contentEqualsIgnoreCase(null, null), is(true));
+        assertThat(AsciiString.contentEqualsIgnoreCase(null, "foo"), is(false));
+        assertThat(AsciiString.contentEqualsIgnoreCase("bar", null), is(false));
+        assertThat(AsciiString.contentEqualsIgnoreCase("FoO", "fOo"), is(true));
     }
 
     @Test(expected = NullPointerException.class)
@@ -68,5 +68,17 @@ public class HttpHeadersTest {
     public void testSetNullHeaderValueNotValidate() {
         HttpHeaders headers = new DefaultHttpHeaders(false);
         headers.set("test", (CharSequence) null);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testAddSelf() {
+        HttpHeaders headers = new DefaultHttpHeaders(false);
+        headers.add(headers);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testSetSelf() {
+        HttpHeaders headers = new DefaultHttpHeaders(false);
+        headers.set(headers);
     }
 }

@@ -15,15 +15,6 @@
 
 package io.netty.handler.codec.http2;
 
-import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_UNSIGNED_INT;
-import static io.netty.handler.codec.http2.Http2TestUtil.as;
-import static io.netty.handler.codec.http2.Http2TestUtil.randomString;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.eq;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
@@ -33,6 +24,8 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
+import io.netty.util.AsciiString;
+import io.netty.util.ByteString;
 import io.netty.util.CharsetUtil;
 import io.netty.util.concurrent.EventExecutor;
 import org.junit.After;
@@ -42,6 +35,20 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
+
+import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_MAX_HEADER_SIZE;
+import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_UNSIGNED_INT;
+import static io.netty.handler.codec.http2.Http2TestUtil.randomString;
+import static org.junit.Assert.fail;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyBoolean;
+import static org.mockito.Matchers.anyInt;
+import static org.mockito.Matchers.anyShort;
+import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Integration tests for {@link DefaultHttp2FrameReader} and {@link DefaultHttp2FrameWriter}.
@@ -114,7 +121,7 @@ public class DefaultHttp2FrameIOTest {
             }
         }).when(ctx).write(any(), any(ChannelPromise.class));
 
-        reader = new DefaultHttp2FrameReader();
+        reader = new DefaultHttp2FrameReader(false);
         writer = new DefaultHttp2FrameWriter();
     }
 
@@ -292,6 +299,20 @@ public class DefaultHttp2FrameIOTest {
     }
 
     @Test
+    public void headersThatAreTooBigShouldFail() throws Exception {
+        Http2Headers headers = headersOfSize(DEFAULT_MAX_HEADER_SIZE + 1);
+        writer.writeHeaders(ctx, 1, headers, 2, (short) 3, true, 0xFF, true, promise);
+        try {
+            reader.readFrame(ctx, buffer, listener);
+            fail();
+        } catch (Http2Exception e) {
+            verify(listener, never()).onHeadersRead(any(ChannelHandlerContext.class), anyInt(),
+                    any(Http2Headers.class), anyInt(), anyShort(), anyBoolean(), anyInt(),
+                    anyBoolean());
+        }
+    }
+
+    @Test
     public void emptypushPromiseShouldRoundtrip() throws Exception {
         Http2Headers headers = EmptyHttp2Headers.INSTANCE;
         writer.writePushPromise(ctx, 1, 2, headers, 0, promise);
@@ -336,7 +357,7 @@ public class DefaultHttp2FrameIOTest {
     }
 
     private static Http2Headers dummyBinaryHeaders() {
-        DefaultHttp2Headers headers = new DefaultHttp2Headers();
+        DefaultHttp2Headers headers = new DefaultHttp2Headers(false);
         for (int ix = 0; ix < 10; ++ix) {
             headers.add(randomString(), randomString());
         }
@@ -344,16 +365,26 @@ public class DefaultHttp2FrameIOTest {
     }
 
     private static Http2Headers dummyHeaders() {
-        return new DefaultHttp2Headers().method(as("GET")).scheme(as("https")).authority(as("example.org"))
-                .path(as("/some/path")).add(as("accept"), as("*/*"));
+        return new DefaultHttp2Headers(false).method(new AsciiString("GET")).scheme(new AsciiString("https"))
+                .authority(new AsciiString("example.org")).path(new AsciiString("/some/path"))
+                .add(new AsciiString("accept"), new AsciiString("*/*"));
     }
 
     private static Http2Headers largeHeaders() {
-        DefaultHttp2Headers headers = new DefaultHttp2Headers();
+        DefaultHttp2Headers headers = new DefaultHttp2Headers(false);
         for (int i = 0; i < 100; ++i) {
             String key = "this-is-a-test-header-key-" + i;
             String value = "this-is-a-test-header-value-" + i;
-            headers.add(as(key), as(value));
+            headers.add(new AsciiString(key), new AsciiString(value));
+        }
+        return headers;
+    }
+
+    private Http2Headers headersOfSize(final int minSize) {
+        final ByteString singleByte = new ByteString(new byte[]{0});
+        DefaultHttp2Headers headers = new DefaultHttp2Headers(false);
+        for (int size = 0; size < minSize; size += 2) {
+            headers.add(singleByte, singleByte);
         }
         return headers;
     }

@@ -16,20 +16,24 @@
 package io.netty.channel.epoll;
 
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.MessageSizeEstimator;
 import io.netty.channel.RecvByteBufAllocator;
 import io.netty.util.NetUtil;
 
+import java.net.InetAddress;
 import java.util.Map;
 
 import static io.netty.channel.ChannelOption.SO_BACKLOG;
 import static io.netty.channel.ChannelOption.SO_RCVBUF;
 import static io.netty.channel.ChannelOption.SO_REUSEADDR;
+import static io.netty.channel.epoll.EpollChannelOption.TCP_MD5SIG;;
 
 public class EpollServerChannelConfig extends EpollChannelConfig {
     protected final AbstractEpollChannel channel;
     private volatile int backlog = NetUtil.SOMAXCONN;
+    private volatile int pendingFastOpenRequestsThreshold;
 
     EpollServerChannelConfig(AbstractEpollChannel channel) {
         super(channel);
@@ -38,7 +42,7 @@ public class EpollServerChannelConfig extends EpollChannelConfig {
 
     @Override
     public Map<ChannelOption<?>, Object> getOptions() {
-        return getOptions(super.getOptions(), SO_RCVBUF, SO_REUSEADDR, SO_BACKLOG);
+        return getOptions(super.getOptions(), SO_RCVBUF, SO_REUSEADDR, SO_BACKLOG, EpollChannelOption.TCP_FASTOPEN);
     }
 
     @SuppressWarnings("unchecked")
@@ -53,6 +57,9 @@ public class EpollServerChannelConfig extends EpollChannelConfig {
         if (option == SO_BACKLOG) {
             return (T) Integer.valueOf(getBacklog());
         }
+        if (option == EpollChannelOption.TCP_FASTOPEN) {
+            return (T) Integer.valueOf(getTcpFastopen());
+        }
         return super.getOption(option);
     }
 
@@ -66,6 +73,12 @@ public class EpollServerChannelConfig extends EpollChannelConfig {
             setReuseAddress((Boolean) value);
         } else if (option == SO_BACKLOG) {
             setBacklog((Integer) value);
+        } else if (option == TCP_MD5SIG) {
+            @SuppressWarnings("unchecked")
+            final Map<InetAddress, byte[]> m = (Map<InetAddress, byte[]>) value;
+            ((EpollServerSocketChannel) channel).setTcpMd5Sig(m);
+        } else if (option == EpollChannelOption.TCP_FASTOPEN) {
+            setTcpFastopen((Integer) value);
         } else {
             return super.setOption(option, value);
         }
@@ -103,6 +116,32 @@ public class EpollServerChannelConfig extends EpollChannelConfig {
         return this;
     }
 
+    /**
+     * Returns threshold value of number of pending for fast open connect.
+     *
+     * @see <a href="https://tools.ietf.org/html/rfc7413#appendix-A.2">RFC 7413 Passive Open</a>
+     */
+    public int getTcpFastopen() {
+        return pendingFastOpenRequestsThreshold;
+    }
+
+    /**
+     * Enables tcpFastOpen on the server channel. If the underlying os doesnt support TCP_FASTOPEN setting this has no
+     * effect. This has to be set before doing listen on the socket otherwise this takes no effect.
+     *
+     * @param pendingFastOpenRequestsThreshold number of requests to be pending for fastopen at a given point in time
+     * for security. @see <a href="https://tools.ietf.org/html/rfc7413#appendix-A.2">RFC 7413 Passive Open</a>
+     *
+     * @see <a href="https://tools.ietf.org/html/rfc7413">RFC 7413 TCP FastOpen</a>
+     */
+    public EpollServerChannelConfig setTcpFastopen(int pendingFastOpenRequestsThreshold) {
+        if (this.pendingFastOpenRequestsThreshold < 0) {
+            throw new IllegalArgumentException("pendingFastOpenRequestsThreshold: " + pendingFastOpenRequestsThreshold);
+        }
+        this.pendingFastOpenRequestsThreshold = pendingFastOpenRequestsThreshold;
+        return this;
+    }
+
     @Override
     public EpollServerChannelConfig setConnectTimeoutMillis(int connectTimeoutMillis) {
         super.setConnectTimeoutMillis(connectTimeoutMillis);
@@ -110,6 +149,7 @@ public class EpollServerChannelConfig extends EpollChannelConfig {
     }
 
     @Override
+    @Deprecated
     public EpollServerChannelConfig setMaxMessagesPerRead(int maxMessagesPerRead) {
         super.setMaxMessagesPerRead(maxMessagesPerRead);
         return this;

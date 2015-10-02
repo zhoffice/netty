@@ -15,6 +15,7 @@
  */
 package io.netty.channel.epoll;
 
+import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -22,7 +23,6 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelConfig;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
@@ -30,7 +30,6 @@ import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.DefaultFileRegion;
 import io.netty.channel.EventLoop;
 import io.netty.channel.RecvByteBufAllocator;
-import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.channel.unix.FileDescriptor;
 import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.MpscLinkedQueueNode;
@@ -47,8 +46,6 @@ import java.nio.channels.ClosedChannelException;
 import java.util.Queue;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-
-import static io.netty.util.internal.ObjectUtil.checkNotNull;
 
 public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
 
@@ -71,7 +68,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
     private SocketAddress requestedRemoteAddress;
     private final Queue<SpliceInTask> spliceQueue = PlatformDependent.newMpscQueue();
 
-    private volatile boolean inputShutdown;
     private volatile boolean outputShutdown;
 
     // Lazy init these if we need to splice(...)
@@ -92,6 +88,14 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
 
     protected AbstractEpollStreamChannel(FileDescriptor fd) {
         super(null, fd, Native.EPOLLIN, Native.getSoError(fd.intValue()) == 0);
+
+        // Add EPOLLRDHUP so we are notified once the remote peer close the connection.
+        flags |= Native.EPOLLRDHUP;
+    }
+
+    @Override
+    protected void shutdown(int fd) throws IOException {
+        Native.shutdown(fd, true, true);
     }
 
     @Override
@@ -282,9 +286,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 }
             } while (offset < end && localWrittenBytes > 0);
         }
-        if (!done) {
-            setFlag(Native.EPOLLOUT);
-        }
         in.removeBytes(initialExpectedWrittenBytes - expectedWrittenBytes);
         return done;
     }
@@ -328,9 +329,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
         }
 
         in.removeBytes(initialExpectedWrittenBytes - expectedWrittenBytes);
-        if (!done) {
-            setFlag(Native.EPOLLOUT);
-        }
         return done;
     }
 
@@ -373,9 +371,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
 
         if (done) {
             in.remove();
-        } else {
-            // Returned EAGAIN need to set EPOLLOUT
-            setFlag(Native.EPOLLOUT);
         }
         return done;
     }
@@ -389,12 +384,14 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
             if (msgCount == 0) {
                 // Wrote all messages.
                 clearFlag(Native.EPOLLOUT);
-                break;
+                // Return here so we not set the EPOLLOUT flag.
+                return;
             }
 
             // Do gathering write if the outbounf buffer entries start with more than one ByteBuf.
             if (msgCount > 1 && in.current() instanceof ByteBuf) {
                 if (!doWriteMultiple(in, writeSpinCount)) {
+                    // Break the loop and so set EPOLLOUT flag.
                     break;
                 }
 
@@ -403,10 +400,14 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 // listeners.
             } else { // msgCount == 1
                 if (!doWriteSingle(in, writeSpinCount)) {
+                    // Break the loop and so set EPOLLOUT flag.
                     break;
                 }
             }
         }
+        // Underlying descriptor can not accept all data currently, so set the EPOLLOUT flag to be woken up
+        // when it can accept more data.
+        setFlag(Native.EPOLLOUT);
     }
 
     protected boolean doWriteSingle(ChannelOutboundBuffer in, int writeSpinCount) throws Exception {
@@ -504,10 +505,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 "unsupported message type: " + StringUtil.simpleClassName(msg) + EXPECTED_TYPES);
     }
 
-    protected boolean isInputShutdown0() {
-        return inputShutdown;
-    }
-
     protected boolean isOutputShutdown0() {
         return outputShutdown || !isActive();
     }
@@ -592,22 +589,7 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
     }
 
     class EpollStreamUnsafe extends AbstractEpollUnsafe {
-
-        private RecvByteBufAllocator.Handle allocHandle;
-
-        private void closeOnRead(ChannelPipeline pipeline) {
-            inputShutdown = true;
-            if (isOpen()) {
-                if (Boolean.TRUE.equals(config().getOption(ChannelOption.ALLOW_HALF_CLOSURE))) {
-                    clearEpollIn0();
-                    pipeline.fireUserEventTriggered(ChannelInputShutdownEvent.INSTANCE);
-                } else {
-                    close(voidPromise());
-                }
-            }
-        }
-
-        private boolean handleReadException(ChannelPipeline pipeline, ByteBuf byteBuf, Throwable cause, boolean close) {
+        private void handleReadException(ChannelPipeline pipeline, ByteBuf byteBuf, Throwable cause, boolean close) {
             if (byteBuf != null) {
                 if (byteBuf.isReadable()) {
                     readPending = false;
@@ -616,13 +598,12 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                     byteBuf.release();
                 }
             }
+            recvBufAllocHandle().readComplete();
             pipeline.fireChannelReadComplete();
             pipeline.fireExceptionCaught(cause);
             if (close || cause instanceof IOException) {
-                closeOnRead(pipeline);
-                return true;
+                shutdownInput();
             }
-            return false;
         }
 
         @Override
@@ -764,15 +745,8 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
         }
 
         @Override
-        void epollRdHupReady() {
-            if (isActive()) {
-                // If it is still active, we need to call epollInReady as otherwise we may miss to
-                // read pending data from the underyling file descriptor.
-                // See https://github.com/netty/netty/issues/3709
-                epollInReady();
-            } else {
-                closeOnRead(pipeline());
-            }
+        protected EpollRecvByteAllocatorHandle newEpollHandle(RecvByteBufAllocator.Handle handle) {
+            return new EpollRecvByteAllocatorStreamingHandle(handle, isFlagSet(Native.EPOLLET));
         }
 
         @Override
@@ -788,19 +762,12 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
 
             final ChannelPipeline pipeline = pipeline();
             final ByteBufAllocator allocator = config.getAllocator();
-            RecvByteBufAllocator.Handle allocHandle = this.allocHandle;
-            if (allocHandle == null) {
-                this.allocHandle = allocHandle = config.getRecvByteBufAllocator().newHandle();
-            }
+            final EpollRecvByteAllocatorHandle allocHandle = recvBufAllocHandle();
+            allocHandle.reset(config);
 
             ByteBuf byteBuf = null;
             boolean close = false;
             try {
-                // if edgeTriggered is used we need to read all messages as we are not notified again otherwise.
-                final int maxMessagesPerRead = edgeTriggered
-                        ? Integer.MAX_VALUE : config.getMaxMessagesPerRead();
-                int messages = 0;
-                int totalReadAmount = 0;
                 do {
                     SpliceInTask spliceTask = spliceQueue.peek();
                     if (spliceTask != null) {
@@ -819,59 +786,30 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                     // we use a direct buffer here as the native implementations only be able
                     // to handle direct buffers.
                     byteBuf = allocHandle.allocate(allocator);
-                    int writable = byteBuf.writableBytes();
-                    int localReadAmount = doReadBytes(byteBuf);
-                    if (localReadAmount <= 0) {
-                        // not was read release the buffer
+                    allocHandle.lastBytesRead(doReadBytes(byteBuf));
+                    if (allocHandle.lastBytesRead() <= 0) {
+                        // nothing was read, release the buffer.
                         byteBuf.release();
-                        close = localReadAmount < 0;
+                        byteBuf = null;
+                        close = allocHandle.lastBytesRead() < 0;
                         break;
                     }
                     readPending = false;
+                    allocHandle.incMessagesRead(1);
                     pipeline.fireChannelRead(byteBuf);
                     byteBuf = null;
+                } while (allocHandle.continueReading());
 
-                    if (totalReadAmount >= Integer.MAX_VALUE - localReadAmount) {
-                        allocHandle.record(totalReadAmount);
-
-                        // Avoid overflow.
-                        totalReadAmount = localReadAmount;
-                    } else {
-                        totalReadAmount += localReadAmount;
-                    }
-
-                    if (localReadAmount < writable) {
-                        // Read less than what the buffer can hold,
-                        // which might mean we drained the recv buffer completely.
-                        break;
-                    }
-                    if (!edgeTriggered && !config.isAutoRead()) {
-                        // This is not using EPOLLET so we can stop reading
-                        // ASAP as we will get notified again later with
-                        // pending data
-                        break;
-                    }
-                } while (++ messages < maxMessagesPerRead);
-
+                allocHandle.readComplete();
                 pipeline.fireChannelReadComplete();
-                allocHandle.record(totalReadAmount);
 
                 if (close) {
-                    closeOnRead(pipeline);
+                    shutdownInput();
                     close = false;
                 }
             } catch (Throwable t) {
-                boolean closed = handleReadException(pipeline, byteBuf, t, close);
-                if (!closed) {
-                    // trigger a read again as there may be something left to read and because of epoll ET we
-                    // will not get notified again until we read everything from the socket
-                    eventLoop().execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            epollInReady();
-                        }
-                    });
-                }
+                handleReadException(pipeline, byteBuf, t, close);
+                checkResetEpollIn(edgeTriggered);
             } finally {
                 // Check if there is a readPending which was not processed yet.
                 // This could be for two reasons:
@@ -916,8 +854,6 @@ public abstract class AbstractEpollStreamChannel extends AbstractEpollChannel {
                 length -= localSplicedIn;
             }
 
-            // record the number of bytes we spliced before
-            handle.record(splicedIn);
             return splicedIn;
         }
     }

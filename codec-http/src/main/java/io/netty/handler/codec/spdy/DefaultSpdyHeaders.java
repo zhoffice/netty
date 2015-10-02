@@ -15,45 +15,35 @@
  */
 package io.netty.handler.codec.spdy;
 
-import io.netty.handler.codec.DefaultTextHeaders;
+import io.netty.handler.codec.CharSequenceValueConverter;
+import io.netty.handler.codec.DefaultHeaders;
 import io.netty.handler.codec.Headers;
-import io.netty.handler.codec.TextHeaders;
-import io.netty.util.AsciiString;
+import io.netty.handler.codec.HeadersUtils;
 
-import java.util.Locale;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map.Entry;
 
-public class DefaultSpdyHeaders extends DefaultTextHeaders implements SpdyHeaders {
-    private static final Headers.ValueConverter<CharSequence> SPDY_VALUE_CONVERTER =
-            new DefaultTextValueTypeConverter() {
+import static io.netty.util.AsciiString.CASE_INSENSITIVE_HASHER;
+import static io.netty.util.AsciiString.CASE_SENSITIVE_HASHER;
+
+public class DefaultSpdyHeaders extends DefaultHeaders<CharSequence> implements SpdyHeaders {
+    private static final NameValidator<CharSequence> SpydNameValidator = new NameValidator<CharSequence>() {
         @Override
-        public CharSequence convertObject(Object value) {
-            CharSequence seq;
-            if (value instanceof CharSequence) {
-                seq = (CharSequence) value;
-            } else {
-                seq = value.toString();
-            }
-
-            SpdyCodecUtil.validateHeaderValue(seq);
-            return seq;
-        }
-    };
-
-    private static final NameConverter<CharSequence> SPDY_NAME_CONVERTER = new NameConverter<CharSequence>() {
-        @Override
-        public CharSequence convertName(CharSequence name) {
-            if (name instanceof AsciiString) {
-                name = ((AsciiString) name).toLowerCase();
-            } else {
-                name = name.toString().toLowerCase(Locale.US);
-            }
+        public void validateName(CharSequence name) {
             SpdyCodecUtil.validateHeaderName(name);
-            return name;
         }
     };
 
     public DefaultSpdyHeaders() {
-        super(true, SPDY_VALUE_CONVERTER, SPDY_NAME_CONVERTER);
+        this(true);
+    }
+
+    @SuppressWarnings("unchecked")
+    public DefaultSpdyHeaders(boolean validate) {
+        super(CASE_INSENSITIVE_HASHER,
+                validate ? HeaderValueConverterAndValidator.INSTANCE : HeaderValueConverter.INSTANCE,
+                validate ? SpydNameValidator : NameValidator.NOT_NULL);
     }
 
     @Override
@@ -147,7 +137,7 @@ public class DefaultSpdyHeaders extends DefaultTextHeaders implements SpdyHeader
     }
 
     @Override
-    public SpdyHeaders add(TextHeaders headers) {
+    public SpdyHeaders add(Headers<? extends CharSequence> headers) {
         super.add(headers);
         return this;
     }
@@ -243,13 +233,13 @@ public class DefaultSpdyHeaders extends DefaultTextHeaders implements SpdyHeader
     }
 
     @Override
-    public SpdyHeaders set(TextHeaders headers) {
+    public SpdyHeaders set(Headers<? extends CharSequence> headers) {
         super.set(headers);
         return this;
     }
 
     @Override
-    public SpdyHeaders setAll(TextHeaders headers) {
+    public SpdyHeaders setAll(Headers<? extends CharSequence> headers) {
         super.setAll(headers);
         return this;
     }
@@ -258,5 +248,58 @@ public class DefaultSpdyHeaders extends DefaultTextHeaders implements SpdyHeader
     public SpdyHeaders clear() {
         super.clear();
         return this;
+    }
+
+    @Override
+    public String getAsString(CharSequence name) {
+        return HeadersUtils.getAsString(this, name);
+    }
+
+    @Override
+    public List<String> getAllAsString(CharSequence name) {
+        return HeadersUtils.getAllAsString(this, name);
+    }
+
+    @Override
+    public Iterator<Entry<String, String>> iteratorAsString() {
+        return HeadersUtils.iteratorAsString(this);
+    }
+
+    @Override
+    public boolean contains(CharSequence name, CharSequence value) {
+        return contains(name, value, false);
+    }
+
+    @Override
+    public boolean contains(CharSequence name, CharSequence value, boolean ignoreCase) {
+        return contains(name, value,
+                ignoreCase ? CASE_INSENSITIVE_HASHER : CASE_SENSITIVE_HASHER);
+    }
+
+    private static class HeaderValueConverter extends CharSequenceValueConverter {
+        public static final HeaderValueConverter INSTANCE = new HeaderValueConverter();
+
+        @Override
+        public CharSequence convertObject(Object value) {
+            final CharSequence seq;
+            if (value instanceof CharSequence) {
+                seq = (CharSequence) value;
+            } else {
+                seq = value.toString();
+            }
+
+            return seq;
+        }
+    }
+
+    private static final class HeaderValueConverterAndValidator extends HeaderValueConverter {
+        public static final HeaderValueConverterAndValidator INSTANCE = new HeaderValueConverterAndValidator();
+
+        @Override
+        public CharSequence convertObject(Object value) {
+            final CharSequence seq = super.convertObject(value);
+            SpdyCodecUtil.validateHeaderValue(seq);
+            return seq;
+        }
     }
 }

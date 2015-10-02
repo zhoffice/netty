@@ -16,7 +16,6 @@
 
 package io.netty.buffer;
 
-import io.netty.buffer.PooledByteBufAllocator.PoolThreadLocalCache;
 import io.netty.util.Recycler;
 import io.netty.util.internal.PlatformDependent;
 
@@ -42,8 +41,7 @@ final class PooledUnsafeDirectByteBuf extends PooledByteBuf<ByteBuffer> {
 
     static PooledUnsafeDirectByteBuf newInstance(int maxCapacity) {
         PooledUnsafeDirectByteBuf buf = RECYCLER.get();
-        buf.setRefCnt(1);
-        buf.maxCapacity(maxCapacity);
+        buf.reuse(maxCapacity);
         return buf;
     }
 

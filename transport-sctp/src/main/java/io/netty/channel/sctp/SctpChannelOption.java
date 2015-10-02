@@ -20,7 +20,7 @@ import io.netty.channel.ChannelOption;
 
 import java.net.SocketAddress;
 
-import static io.netty.channel.ChannelOption.*;
+import static io.netty.channel.ChannelOption.valueOf;
 
 /**
  * Option for configuring the SCTP transport

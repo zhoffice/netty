@@ -37,7 +37,6 @@ public final class StringUtil {
     public static final char CARRIAGE_RETURN = '\r';
     public static final char TAB = '\t';
 
-    public static final byte UPPER_CASE_TO_LOWER_CASE_ASCII_OFFSET = 'a' - 'A';
     private static final String[] BYTE2HEX_PAD = new String[256];
     private static final String[] BYTE2HEX_NOPAD = new String[256];
 
@@ -52,11 +51,14 @@ public final class StringUtil {
         // Determine the newline character of the current platform.
         String newLine;
 
+        Formatter formatter = new Formatter();
         try {
-            newLine = new Formatter().format("%n").toString();
+            newLine = formatter.format("%n").toString();
         } catch (Exception e) {
             // Should not reach here, but just in case.
             newLine = "\n";
+        } finally {
+            formatter.close();
         }
 
         NEWLINE = newLine;
@@ -373,6 +375,20 @@ public final class StringUtil {
         }
         return escapedDoubleQuote || foundSpecialCharacter && !quoted ?
                 escaped.append(DOUBLE_QUOTE) : value;
+    }
+
+    /**
+     * Get the length of a string, {@code null} input is considered {@code 0} length.
+     */
+    public static int length(String s) {
+        return s == null ? 0 : s.length();
+    }
+
+    /**
+     * Determine if a string is {@code null} or {@link String#isEmpty()} returns {@code true}.
+     */
+    public static boolean isNullOrEmpty(String s) {
+        return s == null || s.isEmpty();
     }
 
     private static boolean isDoubleQuote(char c) {

@@ -25,7 +25,7 @@ import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.HttpConstants;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpHeaderNames;
-import io.netty.handler.codec.http.HttpHeaderUtil;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
@@ -507,6 +507,9 @@ public class HttpPostRequestEncoder implements ChunkedInput<HttpContent> {
             Attribute attribute = (Attribute) data;
             internal.addValue(HttpHeaderNames.CONTENT_DISPOSITION + ": " + HttpHeaderValues.FORM_DATA + "; "
                     + HttpHeaderValues.NAME + "=\"" + attribute.getName() + "\"\r\n");
+            // Add Content-Length: xxx
+            internal.addValue(HttpHeaderNames.CONTENT_LENGTH + ": " +
+                    attribute.length() + "\r\n");
             Charset localcharset = attribute.getCharset();
             if (localcharset != null) {
                 // Content-Type: text/plain; charset=charset
@@ -655,6 +658,9 @@ public class HttpPostRequestEncoder implements ChunkedInput<HttpContent> {
                         + HttpHeaderValues.NAME + "=\"" + fileUpload.getName() + "\"; "
                         + HttpHeaderValues.FILENAME + "=\"" + fileUpload.getFilename() + "\"\r\n");
             }
+            // Add Content-Length: xxx
+            internal.addValue(HttpHeaderNames.CONTENT_LENGTH + ": " +
+                    fileUpload.length() + "\r\n");
             // Content-Type: image/gif
             // Content-Type: text/plain; charset=ISO-8859-1
             // Content-Transfer-Encoding: binary
@@ -711,7 +717,7 @@ public class HttpPostRequestEncoder implements ChunkedInput<HttpContent> {
         }
 
         HttpHeaders headers = request.headers();
-        List<String> contentTypes = headers.getAllAndConvert(HttpHeaderNames.CONTENT_TYPE);
+        List<String> contentTypes = headers.getAllAsString(HttpHeaderNames.CONTENT_TYPE);
         List<CharSequence> transferEncoding = headers.getAll(HttpHeaderNames.TRANSFER_ENCODING);
         if (contentTypes != null) {
             headers.remove(HttpHeaderNames.CONTENT_TYPE);
@@ -748,14 +754,14 @@ public class HttpPostRequestEncoder implements ChunkedInput<HttpContent> {
             if (transferEncoding != null) {
                 headers.remove(HttpHeaderNames.TRANSFER_ENCODING);
                 for (CharSequence v : transferEncoding) {
-                    if (HttpHeaderValues.CHUNKED.equalsIgnoreCase(v)) {
+                    if (HttpHeaderValues.CHUNKED.contentEqualsIgnoreCase(v)) {
                         // ignore
                     } else {
                         headers.add(HttpHeaderNames.TRANSFER_ENCODING, v);
                     }
                 }
             }
-            HttpHeaderUtil.setTransferEncodingChunked(request, true);
+            HttpUtil.setTransferEncodingChunked(request, true);
 
             // wrap to hide the possible content
             return new WrappedHttpRequest(request);

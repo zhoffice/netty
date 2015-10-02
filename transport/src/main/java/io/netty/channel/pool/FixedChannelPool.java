@@ -96,12 +96,7 @@ public final class FixedChannelPool extends SimpleChannelPool {
      */
     public FixedChannelPool(Bootstrap bootstrap,
                             ChannelPoolHandler handler, int maxConnections, int maxPendingAcquires) {
-        super(bootstrap, handler);
-        executor = bootstrap.group().next();
-        timeoutTask = null;
-        acquireTimeoutNanos = -1;
-        this.maxConnections = maxConnections;
-        this.maxPendingAcquires = maxPendingAcquires;
+        this(bootstrap, handler, ChannelHealthChecker.ACTIVE, null, -1, maxConnections, maxPendingAcquires);
     }
 
     /**
@@ -122,11 +117,38 @@ public final class FixedChannelPool extends SimpleChannelPool {
      *                              be failed.
      */
     public FixedChannelPool(Bootstrap bootstrap,
-                            ChannelPoolHandler  handler,
+                            ChannelPoolHandler handler,
                             ChannelHealthChecker healthCheck, AcquireTimeoutAction action,
                             final long acquireTimeoutMillis,
                             int maxConnections, int maxPendingAcquires) {
-        super(bootstrap, handler, healthCheck);
+        this(bootstrap, handler, healthCheck, action, acquireTimeoutMillis, maxConnections, maxPendingAcquires, true);
+    }
+
+    /**
+     * Creates a new instance.
+     *
+     * @param bootstrap             the {@link Bootstrap} that is used for connections
+     * @param handler               the {@link ChannelPoolHandler} that will be notified for the different pool actions
+     * @param healthCheck           the {@link ChannelHealthChecker} that will be used to check if a {@link Channel} is
+     *                              still healty when obtain from the {@link ChannelPool}
+     * @param action                the {@link AcquireTimeoutAction} to use or {@code null} if non should be used.
+     *                              In this case {@param acquireTimeoutMillis} must be {@code -1}.
+     * @param acquireTimeoutMillis  the time (in milliseconds) after which an pending acquire must complete or
+     *                              the {@link AcquireTimeoutAction} takes place.
+     * @param maxConnections        the numnber of maximal active connections, once this is reached new tries to
+     *                              acquire a {@link Channel} will be delayed until a connection is returned to the
+     *                              pool again.
+     * @param maxPendingAcquires    the maximum number of pending acquires. Once this is exceed acquire tries will
+     *                              be failed.
+     * @param releaseHealthCheck    will check channel health before offering back if this parameter set to
+     *                              {@code true}.
+     */
+    public FixedChannelPool(Bootstrap bootstrap,
+                            ChannelPoolHandler handler,
+                            ChannelHealthChecker healthCheck, AcquireTimeoutAction action,
+                            final long acquireTimeoutMillis,
+                            int maxConnections, int maxPendingAcquires, final boolean releaseHealthCheck) {
+        super(bootstrap, handler, healthCheck, releaseHealthCheck);
         if (maxConnections < 1) {
             throw new IllegalArgumentException("maxConnections: " + maxConnections + " (expected: >= 1)");
         }
@@ -158,7 +180,7 @@ public final class FixedChannelPool extends SimpleChannelPool {
                     public void onTimeout(AcquireTask task) {
                         // Increment the acquire count and delegate to super to actually acquire a Channel which will
                         // create a new connetion.
-                        ++acquiredChannelCount;
+                        task.acquired();
 
                         FixedChannelPool.super.acquire(task.promise);
                     }
@@ -196,14 +218,14 @@ public final class FixedChannelPool extends SimpleChannelPool {
         assert executor.inEventLoop();
 
         if (acquiredChannelCount < maxConnections) {
-            ++acquiredChannelCount;
-
-            assert acquiredChannelCount > 0;
+            assert acquiredChannelCount >= 0;
 
             // We need to create a new promise as we need to ensure the AcquireListener runs in the correct
             // EventLoop
             Promise<Channel> p = executor.newPromise();
-            p.addListener(new AcquireListener(promise));
+            AcquireListener l = new AcquireListener(promise);
+            l.acquired();
+            p.addListener(l);
             super.acquire(p);
         } else {
             if (pendingAcquireCount >= maxPendingAcquires) {
@@ -264,7 +286,7 @@ public final class FixedChannelPool extends SimpleChannelPool {
     }
 
     private void runTaskQueue() {
-        while (acquiredChannelCount <= maxConnections) {
+        while (acquiredChannelCount < maxConnections) {
             AcquireTask task = pendingAcquireQueue.poll();
             if (task == null) {
                 break;
@@ -277,7 +299,7 @@ public final class FixedChannelPool extends SimpleChannelPool {
             }
 
             --pendingAcquireCount;
-            ++acquiredChannelCount;
+            task.acquired();
 
             super.acquire(task.promise);
         }
@@ -327,6 +349,7 @@ public final class FixedChannelPool extends SimpleChannelPool {
 
     private class AcquireListener implements FutureListener<Channel> {
         private final Promise<Channel> originalPromise;
+        protected boolean acquired;
 
         AcquireListener(Promise<Channel> originalPromise) {
             this.originalPromise = originalPromise;
@@ -339,10 +362,22 @@ public final class FixedChannelPool extends SimpleChannelPool {
             if (future.isSuccess()) {
                 originalPromise.setSuccess(future.getNow());
             } else {
-                // Something went wrong try to run pending acquire tasks.
-                decrementAndRunTaskQueue();
+                if (acquired) {
+                    decrementAndRunTaskQueue();
+                } else {
+                    runTaskQueue();
+                }
+
                 originalPromise.setFailure(future.cause());
             }
+        }
+
+        public void acquired() {
+            if (acquired) {
+                return;
+            }
+            acquiredChannelCount++;
+            acquired = true;
         }
     }
 

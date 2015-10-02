@@ -32,6 +32,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.channel.ChannelPromiseNotifier;
 import io.netty.channel.PendingWriteQueue;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.UnsupportedMessageTypeException;
 import io.netty.util.concurrent.DefaultPromise;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.Future;
@@ -229,6 +230,8 @@ public class SslHandler extends ByteToMessageDecoder {
      */
     private boolean needsFlush;
 
+    private boolean outboundClosed;
+
     private int packetLength;
 
     /**
@@ -366,6 +369,7 @@ public class SslHandler extends ByteToMessageDecoder {
         ctx.executor().execute(new Runnable() {
             @Override
             public void run() {
+                SslHandler.this.outboundClosed = true;
                 engine.closeOutbound();
                 try {
                     write(ctx, Unpooled.EMPTY_BUFFER, future);
@@ -423,6 +427,10 @@ public class SslHandler extends ByteToMessageDecoder {
 
     @Override
     public void write(final ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        if (!(msg instanceof ByteBuf)) {
+            promise.setFailure(new UnsupportedMessageTypeException(msg, ByteBuf.class));
+            return;
+        }
         pendingUnencryptedWrites.add(msg, promise);
     }
 
@@ -459,11 +467,6 @@ public class SslHandler extends ByteToMessageDecoder {
                 Object msg = pendingUnencryptedWrites.current();
                 if (msg == null) {
                     break;
-                }
-
-                if (!(msg instanceof ByteBuf)) {
-                    pendingUnencryptedWrites.removeAndWrite();
-                    continue;
                 }
 
                 ByteBuf buf = (ByteBuf) msg;
@@ -581,6 +584,12 @@ public class SslHandler extends ByteToMessageDecoder {
                 if (result.bytesProduced() == 0) {
                     break;
                 }
+
+                // It should not consume empty buffers when it is not handshaking
+                // Fix for Android, where it was encrypting empty buffers even when not handshaking
+                if (result.bytesConsumed() == 0 && result.getHandshakeStatus() == HandshakeStatus.NOT_HANDSHAKING) {
+                    break;
+                }
             }
         } catch (SSLException e) {
             setHandshakeFailure(ctx, e);
@@ -653,7 +662,7 @@ public class SslHandler extends ByteToMessageDecoder {
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         // Make sure to release SSLEngine,
         // and notify the handshake future if the connection has been closed during handshake.
-        setHandshakeFailure(ctx, CHANNEL_CLOSED);
+        setHandshakeFailure(ctx, CHANNEL_CLOSED, !outboundClosed);
         super.channelInactive(ctx);
     }
 
@@ -983,9 +992,26 @@ public class SslHandler extends ByteToMessageDecoder {
                 offset += consumed;
                 length -= consumed;
 
-                if (status == Status.CLOSED) {
+                switch (status) {
+                case BUFFER_OVERFLOW:
+                    int readableBytes = decodeOut.readableBytes();
+                    if (readableBytes > 0) {
+                        decoded = true;
+                        ctx.fireChannelRead(decodeOut);
+                    } else {
+                        decodeOut.release();
+                    }
+                    // Allocate a new buffer which can hold all the rest data and loop again.
+                    // TODO: We may want to reconsider how we calculate the length here as we may
+                    // have more then one ssl message to decode.
+                    decodeOut = allocate(ctx, engine.getSession().getApplicationBufferSize() - readableBytes);
+                    continue;
+                case CLOSED:
                     // notify about the CLOSED state of the SSLEngine. See #137
                     notifyClosure = true;
+                    break;
+                default:
+                    break;
                 }
 
                 switch (handshakeStatus) {
@@ -1049,6 +1075,8 @@ public class SslHandler extends ByteToMessageDecoder {
     private SSLEngineResult unwrap(
             SSLEngine engine, ByteBuf in, int readerIndex, int len, ByteBuf out) throws SSLException {
         int nioBufferCount = in.nioBufferCount();
+        int writerIndex = out.writerIndex();
+        final SSLEngineResult result;
         if (engine instanceof OpenSslEngine && nioBufferCount > 1) {
             /**
              * If {@link OpenSslEngine} is in use,
@@ -1056,77 +1084,24 @@ public class SslHandler extends ByteToMessageDecoder {
              * that accepts multiple {@link ByteBuffer}s without additional memory copies.
              */
             OpenSslEngine opensslEngine = (OpenSslEngine) engine;
-            int overflows = 0;
-            ByteBuffer[] in0 = in.nioBuffers(readerIndex, len);
             try {
-                for (;;) {
-                    int writerIndex = out.writerIndex();
-                    int writableBytes = out.writableBytes();
-                    ByteBuffer out0;
-                    if (out.nioBufferCount() == 1) {
-                        out0 = out.internalNioBuffer(writerIndex, writableBytes);
-                    } else {
-                        out0 = out.nioBuffer(writerIndex, writableBytes);
-                    }
-                    singleBuffer[0] = out0;
-                    SSLEngineResult result = opensslEngine.unwrap(in0, singleBuffer);
-                    out.writerIndex(out.writerIndex() + result.bytesProduced());
-                    switch (result.getStatus()) {
-                        case BUFFER_OVERFLOW:
-                            int max = engine.getSession().getApplicationBufferSize();
-                            switch (overflows ++) {
-                                case 0:
-                                    out.ensureWritable(Math.min(max, in.readableBytes()));
-                                    break;
-                                default:
-                                    out.ensureWritable(max);
-                            }
-                            break;
-                        default:
-                            return result;
-                    }
-                }
+                singleBuffer[0] = toByteBuffer(out, writerIndex, out.writableBytes());
+                result = opensslEngine.unwrap(in.nioBuffers(readerIndex, len), singleBuffer);
+                out.writerIndex(writerIndex + result.bytesProduced());
             } finally {
                 singleBuffer[0] = null;
             }
         } else {
-            int overflows = 0;
-            ByteBuffer in0;
-            if (nioBufferCount == 1) {
-                // Use internalNioBuffer to reduce object creation.
-                in0 = in.internalNioBuffer(readerIndex, len);
-            } else {
-                // This should never be true as this is only the case when OpenSslEngine is used, anyway lets
-                // guard against it.
-                in0 = in.nioBuffer(readerIndex, len);
-            }
-            for (;;) {
-                int writerIndex = out.writerIndex();
-                int writableBytes = out.writableBytes();
-                ByteBuffer out0;
-                if (out.nioBufferCount() == 1) {
-                    out0 = out.internalNioBuffer(writerIndex, writableBytes);
-                } else {
-                    out0 = out.nioBuffer(writerIndex, writableBytes);
-                }
-                SSLEngineResult result = engine.unwrap(in0, out0);
-                out.writerIndex(out.writerIndex() + result.bytesProduced());
-                switch (result.getStatus()) {
-                    case BUFFER_OVERFLOW:
-                        int max = engine.getSession().getApplicationBufferSize();
-                        switch (overflows ++) {
-                            case 0:
-                                out.ensureWritable(Math.min(max, in.readableBytes()));
-                                break;
-                            default:
-                                out.ensureWritable(max);
-                        }
-                        break;
-                    default:
-                        return result;
-                }
-            }
+            result = engine.unwrap(toByteBuffer(in, readerIndex, len),
+                                                   toByteBuffer(out, writerIndex, out.writableBytes()));
         }
+        out.writerIndex(writerIndex + result.bytesProduced());
+        return result;
+    }
+
+    private static ByteBuffer toByteBuffer(ByteBuf out, int index, int len) {
+        return out.nioBufferCount() == 1 ? out.internalNioBuffer(index, len) :
+                out.nioBuffer(index, len);
     }
 
     /**
@@ -1185,20 +1160,29 @@ public class SslHandler extends ByteToMessageDecoder {
      * Notify all the handshake futures about the failure during the handshake.
      */
     private void setHandshakeFailure(ChannelHandlerContext ctx, Throwable cause) {
+        setHandshakeFailure(ctx, cause, true);
+    }
+
+    /**
+     * Notify all the handshake futures about the failure during the handshake.
+     */
+    private void setHandshakeFailure(ChannelHandlerContext ctx, Throwable cause, boolean closeInbound) {
         // Release all resources such as internal buffers that SSLEngine
         // is managing.
         engine.closeOutbound();
 
-        try {
-            engine.closeInbound();
-        } catch (SSLException e) {
-            // only log in debug mode as it most likely harmless and latest chrome still trigger
-            // this all the time.
-            //
-            // See https://github.com/netty/netty/issues/1340
-            String msg = e.getMessage();
-            if (msg == null || !msg.contains("possible truncation attack")) {
-                logger.debug("{} SSLEngine.closeInbound() raised an exception.", ctx.channel(), e);
+        if (closeInbound) {
+            try {
+                engine.closeInbound();
+            } catch (SSLException e) {
+                // only log in debug mode as it most likely harmless and latest chrome still trigger
+                // this all the time.
+                //
+                // See https://github.com/netty/netty/issues/1340
+                String msg = e.getMessage();
+                if (msg == null || !msg.contains("possible truncation attack")) {
+                    logger.debug("{} SSLEngine.closeInbound() raised an exception.", ctx.channel(), e);
+                }
             }
         }
         notifyHandshakeFailure(cause);
@@ -1223,6 +1207,7 @@ public class SslHandler extends ByteToMessageDecoder {
             return;
         }
 
+        outboundClosed = true;
         engine.closeOutbound();
 
         ChannelPromise closeNotifyFuture = ctx.newPromise();

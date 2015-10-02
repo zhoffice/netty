@@ -19,10 +19,12 @@ package io.netty.handler.ssl.util;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.base64.Base64;
 import io.netty.util.CharsetUtil;
+import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -33,6 +35,7 @@ import java.security.PrivateKey;
 import java.security.SecureRandom;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Date;
 
@@ -57,18 +60,31 @@ public final class SelfSignedCertificate {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(SelfSignedCertificate.class);
 
     /** Current time minus 1 year, just in case software clock goes back due to time synchronization */
-    static final Date NOT_BEFORE = new Date(System.currentTimeMillis() - 86400000L * 365);
+    private static final Date DEFAULT_NOT_BEFORE = new Date(SystemPropertyUtil.getLong(
+            "io.netty.selfSignedCertificate.defaultNotBefore", System.currentTimeMillis() - 86400000L * 365));
     /** The maximum possible value in X.509 specification: 9999-12-31 23:59:59 */
-    static final Date NOT_AFTER = new Date(253402300799000L);
+    private static final Date DEFAULT_NOT_AFTER = new Date(SystemPropertyUtil.getLong(
+            "io.netty.selfSignedCertificate.defaultNotAfter", 253402300799000L));
 
     private final File certificate;
     private final File privateKey;
+    private final X509Certificate cert;
+    private final PrivateKey key;
 
     /**
      * Creates a new instance.
      */
     public SelfSignedCertificate() throws CertificateException {
-        this("example.com");
+        this(DEFAULT_NOT_BEFORE, DEFAULT_NOT_AFTER);
+    }
+
+    /**
+     * Creates a new instance.
+     * @param notBefore Certificate is not valid before this time
+     * @param notAfter Certificate is not valid after this time
+     */
+    public SelfSignedCertificate(Date notBefore, Date notAfter) throws CertificateException {
+        this("example.com", notBefore, notAfter);
     }
 
     /**
@@ -77,9 +93,20 @@ public final class SelfSignedCertificate {
      * @param fqdn a fully qualified domain name
      */
     public SelfSignedCertificate(String fqdn) throws CertificateException {
+        this(fqdn, DEFAULT_NOT_BEFORE, DEFAULT_NOT_AFTER);
+    }
+
+    /**
+     * Creates a new instance.
+     *
+     * @param fqdn a fully qualified domain name
+     * @param notBefore Certificate is not valid before this time
+     * @param notAfter Certificate is not valid after this time
+     */
+    public SelfSignedCertificate(String fqdn, Date notBefore, Date notAfter) throws CertificateException {
         // Bypass entrophy collection by using insecure random generator.
         // We just want to generate it without any delay because it's for testing purposes only.
-        this(fqdn, ThreadLocalInsecureRandom.current(), 1024);
+        this(fqdn, ThreadLocalInsecureRandom.current(), 1024, notBefore, notAfter);
     }
 
     /**
@@ -90,6 +117,20 @@ public final class SelfSignedCertificate {
      * @param bits the number of bits of the generated private key
      */
     public SelfSignedCertificate(String fqdn, SecureRandom random, int bits) throws CertificateException {
+        this(fqdn, random, bits, DEFAULT_NOT_BEFORE, DEFAULT_NOT_AFTER);
+    }
+
+    /**
+     * Creates a new instance.
+     *
+     * @param fqdn a fully qualified domain name
+     * @param random the {@link java.security.SecureRandom} to use
+     * @param bits the number of bits of the generated private key
+     * @param notBefore Certificate is not valid before this time
+     * @param notAfter Certificate is not valid after this time
+     */
+    public SelfSignedCertificate(String fqdn, SecureRandom random, int bits, Date notBefore, Date notAfter)
+            throws CertificateException {
         // Generate an RSA key pair.
         final KeyPair keypair;
         try {
@@ -104,12 +145,12 @@ public final class SelfSignedCertificate {
         String[] paths;
         try {
             // Try the OpenJDK's proprietary implementation.
-            paths = OpenJdkSelfSignedCertGenerator.generate(fqdn, keypair, random);
+            paths = OpenJdkSelfSignedCertGenerator.generate(fqdn, keypair, random, notBefore, notAfter);
         } catch (Throwable t) {
             logger.debug("Failed to generate a self-signed X.509 certificate using sun.security.x509:", t);
             try {
                 // Try Bouncy Castle if the current JVM didn't have sun.security.x509.
-                paths = BouncyCastleSelfSignedCertGenerator.generate(fqdn, keypair, random);
+                paths = BouncyCastleSelfSignedCertGenerator.generate(fqdn, keypair, random, notBefore, notAfter);
             } catch (Throwable t2) {
                 logger.debug("Failed to generate a self-signed X.509 certificate using Bouncy Castle:", t2);
                 throw new CertificateException(
@@ -120,6 +161,13 @@ public final class SelfSignedCertificate {
 
         certificate = new File(paths[0]);
         privateKey = new File(paths[1]);
+        key = keypair.getPrivate();
+        try {
+            cert = (X509Certificate) CertificateFactory.getInstance("X509").generateCertificate(
+                    new FileInputStream(certificate));
+        } catch (Exception e) {
+            throw new CertificateEncodingException(e);
+        }
     }
 
     /**
@@ -134,6 +182,20 @@ public final class SelfSignedCertificate {
      */
     public File privateKey() {
         return privateKey;
+    }
+
+    /**
+     *  Returns the generated X.509 certificate.
+     */
+    public X509Certificate cert() {
+        return cert;
+    }
+
+    /**
+     * Returns the generated RSA private key.
+     */
+    public PrivateKey key() {
+        return key;
     }
 
     /**

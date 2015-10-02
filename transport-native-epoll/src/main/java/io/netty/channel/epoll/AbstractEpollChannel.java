@@ -22,7 +22,10 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.AbstractChannel;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelMetadata;
+import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoop;
+import io.netty.channel.RecvByteBufAllocator;
+import io.netty.channel.socket.ChannelInputShutdownEvent;
 import io.netty.channel.unix.FileDescriptor;
 import io.netty.channel.unix.UnixChannel;
 import io.netty.util.ReferenceCountUtil;
@@ -34,12 +37,13 @@ import java.nio.ByteBuffer;
 import java.nio.channels.UnresolvedAddressException;
 
 abstract class AbstractEpollChannel extends AbstractChannel implements UnixChannel {
-    private static final ChannelMetadata DATA = new ChannelMetadata(false);
+    private static final ChannelMetadata METADATA = new ChannelMetadata(false);
     private final int readFlag;
     private final FileDescriptor fileDescriptor;
     protected int flags = Native.EPOLLET;
 
     protected volatile boolean active;
+    private volatile boolean inputShutdown;
 
     AbstractEpollChannel(int fd, int flag) {
         this(null, fd, flag, false);
@@ -93,20 +97,32 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
 
     @Override
     public ChannelMetadata metadata() {
-        return DATA;
+        return METADATA;
     }
 
     @Override
     protected void doClose() throws Exception {
-        active = false;
+        boolean active = this.active;
+        this.active = false;
+        FileDescriptor fd = fileDescriptor;
         try {
-            // deregister from epoll now
+            // deregister from epoll now and shutdown the socket.
             doDeregister();
+            if (active) {
+                shutdown(fd.intValue());
+            }
         } finally {
             // Ensure the file descriptor is closed in all cases.
-            FileDescriptor fd = fileDescriptor;
             fd.close();
         }
+    }
+
+    /**
+     * Called on {@link #doClose()} before the actual {@link FileDescriptor} is closed.
+     * This implementation does nothing.
+     */
+    protected void shutdown(int fd) throws IOException {
+        // NOOP
     }
 
     @Override
@@ -174,6 +190,10 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
         ((EpollEventLoop) eventLoop().unwrap()).add(this);
     }
 
+    protected final boolean isInputShutdown0() {
+        return inputShutdown;
+    }
+
     @Override
     protected abstract AbstractEpollUnsafe newUnsafe();
 
@@ -230,6 +250,7 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
     protected final int doReadBytes(ByteBuf byteBuf) throws Exception {
         int writerIndex = byteBuf.writerIndex();
         int localReadAmount;
+        unsafe().recvBufAllocHandle().attemptedBytesRead(byteBuf.writableBytes());
         if (byteBuf.hasMemoryAddress()) {
             localReadAmount = Native.readAddress(
                     fileDescriptor.intValue(), byteBuf.memoryAddress(), writerIndex, byteBuf.capacity());
@@ -294,6 +315,7 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
 
     protected abstract class AbstractEpollUnsafe extends AbstractUnsafe {
         protected boolean readPending;
+        private EpollRecvByteAllocatorHandle allocHandle;
 
         /**
          * Called once EPOLLIN event is ready to be processed
@@ -301,11 +323,81 @@ abstract class AbstractEpollChannel extends AbstractChannel implements UnixChann
         abstract void epollInReady();
 
         /**
+         * Will schedule a {@link #epollInReady()} call on the event loop if necessary.
+         * @param edgeTriggered {@code true} if the channel is using ET mode. {@code false} otherwise.
+         */
+        final void checkResetEpollIn(boolean edgeTriggered) {
+            if (edgeTriggered && !isInputShutdown0()) {
+                // trigger a read again as there may be something left to read and because of epoll ET we
+                // will not get notified again until we read everything from the socket
+                eventLoop().execute(new OneTimeTask() {
+                    @Override
+                    public void run() {
+                        epollInReady();
+                    }
+                });
+            }
+        }
+
+        /**
          * Called once EPOLLRDHUP event is ready to be processed
          */
-        void epollRdHupReady() {
-            // NOOP
+        final void epollRdHupReady() {
+            if (isActive()) {
+                // If it is still active, we need to call epollInReady as otherwise we may miss to
+                // read pending data from the underlying file descriptor.
+                // See https://github.com/netty/netty/issues/3709
+                epollInReady();
+
+                // Clear the EPOLLRDHUP flag to prevent continuously getting woken up on this event.
+                clearEpollRdHup();
+            }
+            // epollInReady may call this, but we should ensure that it gets called.
+            shutdownInput();
         }
+
+        /**
+         * Clear the {@link Native#EPOLLRDHUP} flag from EPOLL, and close on failure.
+         */
+        private void clearEpollRdHup() {
+            try {
+                clearFlag(Native.EPOLLRDHUP);
+            } catch (IOException e) {
+                pipeline().fireExceptionCaught(e);
+                close(voidPromise());
+            }
+        }
+
+        /**
+         * Shutdown the input side of the channel.
+         */
+        void shutdownInput() {
+            if (!inputShutdown) { // Best effort check on volatile variable to prevent multiple shutdowns
+                inputShutdown = true;
+                if (isOpen()) {
+                    if (Boolean.TRUE.equals(config().getOption(ChannelOption.ALLOW_HALF_CLOSURE))) {
+                        clearEpollIn0();
+                        pipeline().fireUserEventTriggered(ChannelInputShutdownEvent.INSTANCE);
+                    } else {
+                        close(voidPromise());
+                    }
+                }
+            }
+        }
+
+        @Override
+        public EpollRecvByteAllocatorHandle recvBufAllocHandle() {
+            if (allocHandle == null) {
+                allocHandle = newEpollHandle(super.recvBufAllocHandle());
+            }
+            return allocHandle;
+        }
+
+        /**
+         * Create a new {@EpollRecvByteAllocatorHandle} instance.
+         * @param handle The handle to wrap with EPOLL specific logic.
+         */
+        protected abstract EpollRecvByteAllocatorHandle newEpollHandle(RecvByteBufAllocator.Handle handle);
 
         @Override
         protected void flush0() {

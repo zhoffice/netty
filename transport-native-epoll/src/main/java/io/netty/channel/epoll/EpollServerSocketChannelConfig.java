@@ -21,6 +21,7 @@ import io.netty.channel.MessageSizeEstimator;
 import io.netty.channel.RecvByteBufAllocator;
 import io.netty.channel.socket.ServerSocketChannelConfig;
 
+import java.net.InetAddress;
 import java.util.Map;
 
 public final class EpollServerSocketChannelConfig extends EpollServerChannelConfig
@@ -37,7 +38,7 @@ public final class EpollServerSocketChannelConfig extends EpollServerChannelConf
 
     @Override
     public Map<ChannelOption<?>, Object> getOptions() {
-        return getOptions(super.getOptions(), EpollChannelOption.SO_REUSEPORT);
+        return getOptions(super.getOptions(), EpollChannelOption.SO_REUSEPORT, EpollChannelOption.IP_FREEBIND);
     }
 
     @SuppressWarnings("unchecked")
@@ -45,6 +46,9 @@ public final class EpollServerSocketChannelConfig extends EpollServerChannelConf
     public <T> T getOption(ChannelOption<T> option) {
         if (option == EpollChannelOption.SO_REUSEPORT) {
             return (T) Boolean.valueOf(isReusePort());
+        }
+        if (option == EpollChannelOption.IP_FREEBIND) {
+            return (T) Boolean.valueOf(isFreeBind());
         }
         return super.getOption(option);
     }
@@ -55,6 +59,12 @@ public final class EpollServerSocketChannelConfig extends EpollServerChannelConf
 
         if (option == EpollChannelOption.SO_REUSEPORT) {
             setReusePort((Boolean) value);
+        } else if (option == EpollChannelOption.IP_FREEBIND) {
+            setFreeBind((Boolean) value);
+        } else if (option == EpollChannelOption.TCP_MD5SIG) {
+            @SuppressWarnings("unchecked")
+            final Map<InetAddress, byte[]> m = (Map<InetAddress, byte[]>) value;
+            setTcpMd5Sig(m);
         } else {
             return super.setOption(option, value);
         }
@@ -92,6 +102,7 @@ public final class EpollServerSocketChannelConfig extends EpollServerChannelConf
     }
 
     @Override
+    @Deprecated
     public EpollServerSocketChannelConfig setMaxMessagesPerRead(int maxMessagesPerRead) {
         super.setMaxMessagesPerRead(maxMessagesPerRead);
         return this;
@@ -140,6 +151,16 @@ public final class EpollServerSocketChannelConfig extends EpollServerChannelConf
     }
 
     /**
+     * Set the {@code TCP_MD5SIG} option on the socket. See {@code linux/tcp.h} for more details.
+     * Keys can only be set on, not read to prevent a potential leak, as they are confidential.
+     * Allowing them being read would mean anyone with access to the channel could get them.
+     */
+    public EpollServerSocketChannelConfig setTcpMd5Sig(Map<InetAddress, byte[]> keys) {
+        ((EpollServerSocketChannel) channel).setTcpMd5Sig(keys);
+        return this;
+    }
+
+    /**
      * Returns {@code true} if the SO_REUSEPORT option is set.
      */
     public boolean isReusePort() {
@@ -155,6 +176,23 @@ public final class EpollServerSocketChannelConfig extends EpollServerChannelConf
      */
     public EpollServerSocketChannelConfig setReusePort(boolean reusePort) {
         Native.setReusePort(channel.fd().intValue(), reusePort ? 1 : 0);
+        return this;
+    }
+
+    /**
+     * Returns {@code true} if <a href="http://man7.org/linux/man-pages/man7/ip.7.html">IP_FREEBIND</a> is enabled,
+     * {@code false} otherwise.
+     */
+    public boolean isFreeBind() {
+        return Native.isIpFreeBind(channel.fd().intValue()) != 0;
+    }
+
+    /**
+     * If {@code true} is used <a href="http://man7.org/linux/man-pages/man7/ip.7.html">IP_FREEBIND</a> is enabled,
+     * {@code false} for disable it. Default is disabled.
+     */
+    public EpollServerSocketChannelConfig setFreeBind(boolean freeBind) {
+        Native.setIpFreeBind(channel.fd().intValue(), freeBind ? 1: 0);
         return this;
     }
 }

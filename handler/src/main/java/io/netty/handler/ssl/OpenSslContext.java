@@ -15,7 +15,11 @@
  */
 package io.netty.handler.ssl;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.Unpooled;
+import io.netty.handler.codec.base64.Base64;
+import io.netty.util.CharsetUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -31,6 +35,8 @@ import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509ExtendedTrustManager;
 import javax.net.ssl.X509TrustManager;
+import java.security.PrivateKey;
+import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -43,6 +49,10 @@ import static io.netty.handler.ssl.ApplicationProtocolConfig.SelectorFailureBeha
 import static io.netty.handler.ssl.ApplicationProtocolConfig.SelectedListenerFailureBehavior;
 
 public abstract class OpenSslContext extends SslContext {
+    private static final byte[] BEGIN_CERT = "-----BEGIN CERTIFICATE-----\n".getBytes(CharsetUtil.US_ASCII);
+    private static final byte[] END_CERT = "\n-----END CERTIFICATE-----\n".getBytes(CharsetUtil.US_ASCII);
+    private static final byte[] BEGIN_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\n".getBytes(CharsetUtil.US_ASCII);
+    private static final byte[] END_PRIVATE_KEY = "\n-----END PRIVATE KEY-----\n".getBytes(CharsetUtil.US_ASCII);
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(OpenSslContext.class);
     /**
@@ -62,7 +72,7 @@ public abstract class OpenSslContext extends SslContext {
 
     /** The OpenSSL SSL_CTX object */
     protected volatile long ctx;
-    private long aprPool;
+    long aprPool;
     @SuppressWarnings({ "unused", "FieldMayBeFinal" })
     private volatile int aprPoolDestroyed;
     private volatile boolean rejectRemoteInitiatedRenegotiation;
@@ -72,6 +82,8 @@ public abstract class OpenSslContext extends SslContext {
     private final OpenSslEngineMap engineMap = new DefaultOpenSslEngineMap();
     private final OpenSslApplicationProtocolNegotiator apn;
     private final int mode;
+    private final Certificate[] keyCertChain;
+    private final ClientAuth clientAuth;
 
     static final OpenSslApplicationProtocolNegotiator NONE_PROTOCOL_NEGOTIATOR =
             new OpenSslApplicationProtocolNegotiator() {
@@ -107,8 +119,7 @@ public abstract class OpenSslContext extends SslContext {
                 "AES128-GCM-SHA256",
                 "AES128-SHA",
                 "AES256-SHA",
-                "DES-CBC3-SHA",
-                "RC4-SHA");
+                "DES-CBC3-SHA");
         DEFAULT_CIPHERS = Collections.unmodifiableList(ciphers);
 
         if (logger.isDebugEnabled()) {
@@ -117,24 +128,30 @@ public abstract class OpenSslContext extends SslContext {
     }
 
     OpenSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter, ApplicationProtocolConfig apnCfg,
-                   long sessionCacheSize, long sessionTimeout, int mode) throws SSLException {
-        this(ciphers, cipherFilter, toNegotiator(apnCfg), sessionCacheSize, sessionTimeout, mode);
+                   long sessionCacheSize, long sessionTimeout, int mode, Certificate[] keyCertChain,
+                   ClientAuth clientAuth)
+            throws SSLException {
+        this(ciphers, cipherFilter, toNegotiator(apnCfg), sessionCacheSize, sessionTimeout, mode, keyCertChain,
+                clientAuth);
     }
 
     OpenSslContext(Iterable<String> ciphers, CipherSuiteFilter cipherFilter,
                    OpenSslApplicationProtocolNegotiator apn, long sessionCacheSize,
-                   long sessionTimeout, int mode) throws SSLException {
+                   long sessionTimeout, int mode, Certificate[] keyCertChain,
+                   ClientAuth clientAuth) throws SSLException {
         OpenSsl.ensureAvailability();
 
         if (mode != SSL.SSL_MODE_SERVER && mode != SSL.SSL_MODE_CLIENT) {
             throw new IllegalArgumentException("mode most be either SSL.SSL_MODE_SERVER or SSL.SSL_MODE_CLIENT");
         }
         this.mode = mode;
+        this.clientAuth = isServer() ? checkNotNull(clientAuth, "clientAuth") : ClientAuth.NONE;
 
         if (mode == SSL.SSL_MODE_SERVER) {
             rejectRemoteInitiatedRenegotiation =
                     JDK_REJECT_CLIENT_INITIATED_RENEGOTIATION;
         }
+        this.keyCertChain = keyCertChain == null ? null : keyCertChain.clone();
         final List<String> convertedCiphers;
         if (ciphers == null) {
             convertedCiphers = null;
@@ -279,7 +296,7 @@ public abstract class OpenSslContext extends SslContext {
     @Override
     public final SSLEngine newEngine(ByteBufAllocator alloc, String peerHost, int peerPort) {
         final OpenSslEngine engine = new OpenSslEngine(ctx, alloc, isClient(), sessionContext(), apn, engineMap,
-                rejectRemoteInitiatedRenegotiation, peerHost, peerPort);
+                rejectRemoteInitiatedRenegotiation, peerHost, peerPort, keyCertChain, clientAuth);
         engineMap.add(engine);
         return engine;
     }
@@ -458,5 +475,55 @@ public abstract class OpenSslContext extends SslContext {
         public void add(OpenSslEngine engine) {
             engines.put(engine.sslPointer(), engine);
         }
+    }
+
+    /**
+     * Return the pointer to a <a href="https://www.openssl.org/docs/crypto/BIO_get_mem_ptr.html">in-memory BIO</a>
+     * or {@code 0} if the {@code key} is {@code null}. The BIO contains the content of the {@code key}.
+     */
+    static long toBIO(PrivateKey key) throws Exception {
+        if (key == null) {
+            return 0;
+        }
+        ByteBuf buffer = Unpooled.directBuffer();
+        try {
+            buffer.writeBytes(BEGIN_PRIVATE_KEY);
+            buffer.writeBytes(Base64.encode(Unpooled.wrappedBuffer(key.getEncoded()), true));
+            buffer.writeBytes(END_PRIVATE_KEY);
+            return newBIO(buffer);
+        } finally {
+            buffer.release();
+        }
+    }
+
+    /**
+     * Return the pointer to a <a href="https://www.openssl.org/docs/crypto/BIO_get_mem_ptr.html">in-memory BIO</a>
+     * or {@code 0} if the {@code certChain} is {@code null}. The BIO contains the content of the {@code certChain}.
+     */
+    static long toBIO(X509Certificate[] certChain) throws Exception {
+        if (certChain == null) {
+            return 0;
+        }
+        ByteBuf buffer = Unpooled.directBuffer();
+        try {
+            for (X509Certificate cert: certChain) {
+                buffer.writeBytes(BEGIN_CERT);
+                buffer.writeBytes(Base64.encode(Unpooled.wrappedBuffer(cert.getEncoded()), true));
+                buffer.writeBytes(END_CERT);
+            }
+            return newBIO(buffer);
+        }  finally {
+            buffer.release();
+        }
+    }
+
+    private static long newBIO(ByteBuf buffer) throws Exception {
+        long bio = SSL.newMemBIO();
+        int readable = buffer.readableBytes();
+        if (SSL.writeToBIO(bio, buffer.memoryAddress(), readable) != readable) {
+            SSL.freeBIO(bio);
+            throw new IllegalStateException("Could not write data to memory BIO");
+        }
+        return bio;
     }
 }

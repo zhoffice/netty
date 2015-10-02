@@ -29,6 +29,9 @@ import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
+import static io.netty.handler.codec.http.HttpUtil.getContentLength;
+
 /**
  * A {@link ChannelHandler} that aggregates an {@link HttpMessage}
  * and its following {@link HttpContent}s into a single {@link FullHttpRequest}
@@ -50,28 +53,43 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
  */
 public class HttpObjectAggregator
         extends MessageAggregator<HttpObject, HttpMessage, HttpContent, FullHttpMessage> {
-
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(HttpObjectAggregator.class);
-    private static final FullHttpResponse CONTINUE = new DefaultFullHttpResponse(
-            HttpVersion.HTTP_1_1, HttpResponseStatus.CONTINUE, Unpooled.EMPTY_BUFFER);
+    private static final FullHttpResponse CONTINUE =
+            new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.CONTINUE, Unpooled.EMPTY_BUFFER);
+    private static final FullHttpResponse EXPECTATION_FAILED = new DefaultFullHttpResponse(
+            HttpVersion.HTTP_1_1, HttpResponseStatus.EXPECTATION_FAILED, Unpooled.EMPTY_BUFFER);
     private static final FullHttpResponse TOO_LARGE = new DefaultFullHttpResponse(
             HttpVersion.HTTP_1_1, HttpResponseStatus.REQUEST_ENTITY_TOO_LARGE, Unpooled.EMPTY_BUFFER);
 
     static {
-        TOO_LARGE.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
+        EXPECTATION_FAILED.headers().set(CONTENT_LENGTH, "0");
+        TOO_LARGE.headers().set(CONTENT_LENGTH, "0");
+    }
+
+    private final boolean closeOnExpectationFailed;
+
+    /**
+     * Creates a new instance.
+     * @param maxContentLength the maximum length of the aggregated content in bytes.
+     * If the length of the aggregated content exceeds this value,
+     * {@link #handleOversizedMessage(ChannelHandlerContext, HttpMessage)} will be called.
+     */
+    public HttpObjectAggregator(int maxContentLength) {
+        this(maxContentLength, false);
     }
 
     /**
      * Creates a new instance.
-     *
-     * @param maxContentLength
-     *        the maximum length of the aggregated content in bytes.
-     *        If the length of the aggregated content exceeds this value,
-     *        {@link #handleOversizedMessage(ChannelHandlerContext, HttpMessage)}
-     *        will be called.
+     * @param maxContentLength the maximum length of the aggregated content in bytes.
+     * If the length of the aggregated content exceeds this value,
+     * {@link #handleOversizedMessage(ChannelHandlerContext, HttpMessage)} will be called.
+     * @param closeOnExpectationFailed If a 100-continue response is detected but the content length is too large
+     * then {@code true} means close the connection. otherwise the connection will remain open and data will be
+     * consumed and discarded until the next request is received.
      */
-    public HttpObjectAggregator(int maxContentLength) {
+    public HttpObjectAggregator(int maxContentLength, boolean closeOnExpectationFailed) {
         super(maxContentLength);
+        this.closeOnExpectationFailed = closeOnExpectationFailed;
     }
 
     @Override
@@ -95,29 +113,39 @@ public class HttpObjectAggregator
     }
 
     @Override
-    protected boolean hasContentLength(HttpMessage start) throws Exception {
-        return HttpHeaderUtil.isContentLengthSet(start);
+    protected boolean isContentLengthInvalid(HttpMessage start, int maxContentLength) {
+        return getContentLength(start, -1) > maxContentLength;
     }
 
     @Override
-    protected long contentLength(HttpMessage start) throws Exception {
-        return HttpHeaderUtil.getContentLength(start);
-    }
+    protected Object newContinueResponse(HttpMessage start, int maxContentLength, ChannelPipeline pipeline) {
+        if (HttpUtil.is100ContinueExpected(start)) {
+            if (getContentLength(start, -1) <= maxContentLength) {
+                return CONTINUE.duplicate().retain();
+            }
 
-    @Override
-    protected Object newContinueResponse(HttpMessage start) throws Exception {
-        if (HttpHeaderUtil.is100ContinueExpected(start)) {
-            return CONTINUE;
-        } else {
-            return null;
+            pipeline.fireUserEventTriggered(HttpExpectationFailedEvent.INSTANCE);
+            return EXPECTATION_FAILED.duplicate().retain();
         }
+        return null;
+    }
+
+    @Override
+    protected boolean closeAfterContinueResponse(Object msg) {
+        return closeOnExpectationFailed && ignoreContentAfterContinueResponse(msg);
+    }
+
+    @Override
+    protected boolean ignoreContentAfterContinueResponse(Object msg) {
+        return msg instanceof HttpResponse &&
+               ((HttpResponse) msg).status().code() == HttpResponseStatus.EXPECTATION_FAILED.code();
     }
 
     @Override
     protected FullHttpMessage beginAggregation(HttpMessage start, ByteBuf content) throws Exception {
         assert !(start instanceof FullHttpMessage);
 
-        HttpHeaderUtil.setTransferEncodingChunked(start, false);
+        HttpUtil.setTransferEncodingChunked(start, false);
 
         AggregatedFullHttpMessage ret;
         if (start instanceof HttpRequest) {
@@ -146,7 +174,7 @@ public class HttpObjectAggregator
         // transmitted if a GET would have been used.
         //
         // See rfc2616 14.13 Content-Length
-        if (!HttpHeaderUtil.isContentLengthSet(aggregated)) {
+        if (!HttpUtil.isContentLengthSet(aggregated)) {
             aggregated.headers().set(
                     HttpHeaderNames.CONTENT_LENGTH,
                     String.valueOf(aggregated.content().readableBytes()));
@@ -157,7 +185,8 @@ public class HttpObjectAggregator
     protected void handleOversizedMessage(final ChannelHandlerContext ctx, HttpMessage oversized) throws Exception {
         if (oversized instanceof HttpRequest) {
             // send back a 413 and close the connection
-            ChannelFuture future = ctx.writeAndFlush(TOO_LARGE).addListener(new ChannelFutureListener() {
+            ChannelFuture future = ctx.writeAndFlush(TOO_LARGE.duplicate().retain()).addListener(
+                    new ChannelFutureListener() {
                 @Override
                 public void operationComplete(ChannelFuture future) throws Exception {
                     if (!future.isSuccess()) {
@@ -170,7 +199,7 @@ public class HttpObjectAggregator
             // If the client started to send data already, close because it's impossible to recover.
             // If keep-alive is off and 'Expect: 100-continue' is missing, no need to leave the connection open.
             if (oversized instanceof FullHttpMessage ||
-                !HttpHeaderUtil.is100ContinueExpected(oversized) && !HttpHeaderUtil.isKeepAlive(oversized)) {
+                !HttpUtil.is100ContinueExpected(oversized) && !HttpUtil.isKeepAlive(oversized)) {
                 future.addListener(ChannelFutureListener.CLOSE);
             }
 

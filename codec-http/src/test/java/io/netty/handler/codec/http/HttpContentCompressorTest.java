@@ -18,8 +18,10 @@ package io.netty.handler.codec.http;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.EncoderException;
 import io.netty.handler.codec.compression.ZlibWrapper;
 import io.netty.util.CharsetUtil;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.Test;
 
 import static org.hamcrest.CoreMatchers.*;
@@ -291,6 +293,78 @@ public class HttpContentCompressorTest {
         assertThat(ch.readOutbound(), is(nullValue()));
     }
 
+    @Test
+    public void test100Continue() throws Exception {
+        FullHttpRequest request = newRequest();
+        HttpHeaderUtil.set100ContinueExpected(request, true);
+
+        EmbeddedChannel ch = new EmbeddedChannel(new HttpContentCompressor());
+        ch.writeInbound(request);
+
+        FullHttpResponse continueResponse = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, HttpResponseStatus.CONTINUE, Unpooled.EMPTY_BUFFER);
+
+        ch.writeOutbound(continueResponse);
+
+        FullHttpResponse res = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, HttpResponseStatus.OK, Unpooled.EMPTY_BUFFER);
+        res.trailingHeaders().set("X-Test", "Netty");
+        ch.writeOutbound(res);
+
+        Object o = ch.readOutbound();
+        assertThat(o, is(instanceOf(FullHttpResponse.class)));
+
+        res = (FullHttpResponse) o;
+        assertSame(continueResponse, res);
+        res.release();
+
+        o = ch.readOutbound();
+        assertThat(o, is(instanceOf(FullHttpResponse.class)));
+
+        res = (FullHttpResponse) o;
+        assertThat(res.headers().get(HttpHeaderNames.TRANSFER_ENCODING), is(nullValue()));
+
+        // Content encoding shouldn't be modified.
+        assertThat(res.headers().get(HttpHeaderNames.CONTENT_ENCODING), is(nullValue()));
+        assertThat(res.content().readableBytes(), is(0));
+        assertThat(res.content().toString(CharsetUtil.US_ASCII), is(""));
+        assertEquals("Netty", res.trailingHeaders().get("X-Test"));
+        assertThat(ch.readOutbound(), is(nullValue()));
+    }
+
+    @Test
+    public void testTooManyResponses() throws Exception {
+        FullHttpRequest request = newRequest();
+        EmbeddedChannel ch = new EmbeddedChannel(new HttpContentCompressor());
+        ch.writeInbound(request);
+
+        ch.writeOutbound(new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, HttpResponseStatus.OK, Unpooled.EMPTY_BUFFER));
+
+        try {
+            ch.writeOutbound(new DefaultFullHttpResponse(
+                    HttpVersion.HTTP_1_1, HttpResponseStatus.OK, Unpooled.EMPTY_BUFFER));
+            fail();
+        } catch (EncoderException e) {
+            assertTrue(e.getCause() instanceof IllegalStateException);
+        }
+        assertTrue(ch.finish());
+        for (;;) {
+            Object message = ch.readOutbound();
+            if (message == null) {
+                break;
+            }
+            ReferenceCountUtil.release(message);
+        }
+        for (;;) {
+            Object message = ch.readInbound();
+            if (message == null) {
+                break;
+            }
+            ReferenceCountUtil.release(message);
+        }
+    }
+
     private static FullHttpRequest newRequest() {
         FullHttpRequest req = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/");
         req.headers().set(HttpHeaderNames.ACCEPT_ENCODING, "gzip");
@@ -303,8 +377,8 @@ public class HttpContentCompressorTest {
 
         HttpResponse res = (HttpResponse) o;
         assertThat(res, is(not(instanceOf(HttpContent.class))));
-        assertThat(res.headers().getAndConvert(HttpHeaderNames.TRANSFER_ENCODING), is("chunked"));
+        assertThat(res.headers().getAsString(HttpHeaderNames.TRANSFER_ENCODING), is("chunked"));
         assertThat(res.headers().get(HttpHeaderNames.CONTENT_LENGTH), is(nullValue()));
-        assertThat(res.headers().getAndConvert(HttpHeaderNames.CONTENT_ENCODING), is("gzip"));
+        assertThat(res.headers().getAsString(HttpHeaderNames.CONTENT_ENCODING), is("gzip"));
     }
 }
